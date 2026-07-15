@@ -1,0 +1,19 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Temporary document-upload artifacts
+.tmp/
+
+# Local research records and downloaded assets stay outside this code repository.
+docs/
+resources/

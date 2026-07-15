@@ -1,0 +1,6 @@
+# Keep source and documentation diffs readable across platforms.
+* text=auto eol=lf
+*.safetensors binary
+*.parquet binary
+*.tar.gz binary
+*.bin binary
