@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factorpanel-fm"
+version = "0.1.0"
+description = "Factor panel foundation model data and training runtime"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.9.1",
+  "pandas>=2.3.3",
+  "pyarrow>=22.0.0",
+]
+
+[project.scripts]
+factorpanel-fm = "factorpanel_fm.cli:main"
+
+[tool.setuptools]
+packages = ["factorpanel_fm", "factorpanel_data"]
+package-dir = {factorpanel_fm = "src/factorpanel_fm", factorpanel_data = "src/factorpanel_data"}

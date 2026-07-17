@@ -1,0 +1,15 @@
+name: factorpanel-fm
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch==2.9.1
+      - pandas==2.3.3
+      - pyarrow==22.0.0
+      - pyyaml==6.0.3
+      - ruff==0.14.10
+      - -e .

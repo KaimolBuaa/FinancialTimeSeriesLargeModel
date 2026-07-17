@@ -1,0 +1,47 @@
+{
+  "model": {
+    "context_length": 256,
+    "input_channels": 3,
+    "patch_size": 16,
+    "patch_stride": 8,
+    "d_model": 384,
+    "temporal_layers": 8,
+    "num_heads": 8,
+    "ffn_dim": 1536,
+    "num_latents": 32,
+    "set_layers": 2,
+    "output_dim": 128,
+    "dropout": 0.1,
+    "use_set_mixer": true,
+    "parameter_count": 21390848
+  },
+  "stage_a": {
+    "weights": [1.0, 0.5, 0.1],
+    "future_horizons": [5, 20],
+    "quantiles": [0.1, 0.5, 0.9],
+    "mask_ratio": 0.4
+  },
+  "stage_b": {
+    "weights": [1.0, 0.5, 0.2],
+    "horizons": [1, 5, 20],
+    "initial_freeze_steps": 5000,
+    "unfreeze_lr_scale": 0.1
+  },
+  "server_pilot": {
+    "micro_batch_size": 1,
+    "auto_profile_max_micro_batch_size": 8,
+    "gradient_accumulation": 4,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.05,
+    "warmup_ratio": 0.05,
+    "gradient_clip": 1.0,
+    "bf16": true,
+    "pilot_steps": 20000,
+    "max_steps": 200000
+  },
+  "notes": [
+    "Start server pilots at micro-batch 1.",
+    "Treat 8 only as an upper bound after CUDA memory profiling; it is not a verified batch size.",
+    "PanelFrameDataset is a local adapter, not storage for the full 250k-factor corpus."
+  ]
+}
