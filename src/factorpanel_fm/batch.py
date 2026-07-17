@@ -8,12 +8,16 @@ import torch
 
 
 _INTEGER_DTYPES = {
-    torch.uint8,
     torch.int8,
     torch.int16,
     torch.int32,
     torch.int64,
 }
+_INTEGER_DTYPES.update(
+    dtype
+    for name in ("uint8", "uint16", "uint32", "uint64")
+    if (dtype := getattr(torch, name, None)) is not None
+)
 
 
 @dataclass(frozen=True)

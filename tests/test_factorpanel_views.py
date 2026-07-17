@@ -91,6 +91,25 @@ class FactorPanelBatchTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     FactorPanelBatch(**(fields | overrides))
 
+    def test_accepts_available_unsigned_integer_coordinate_dtypes(self) -> None:
+        valid = self.make_batch()
+        unsigned_dtypes = tuple(
+            dtype
+            for name in ("uint8", "uint16", "uint32", "uint64")
+            if (dtype := getattr(torch, name, None)) is not None
+        )
+
+        for dtype in unsigned_dtypes:
+            with self.subTest(dtype=dtype):
+                batch = FactorPanelBatch(
+                    values=valid.values,
+                    observed_mask=valid.observed_mask,
+                    asset_ids=valid.asset_ids.to(dtype),
+                    dates=valid.dates.to(dtype),
+                )
+                self.assertEqual(batch.asset_ids.dtype, dtype)
+                self.assertEqual(batch.dates.dtype, dtype)
+
     def test_rejects_nonfinite_observed_values_only(self) -> None:
         values = torch.tensor([[[1.0, float("inf")]]])
         common = {
