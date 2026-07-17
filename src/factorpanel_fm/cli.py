@@ -43,7 +43,7 @@ def _module(stage: str, config: ModelConfig, return_count: int = 3) -> torch.nn.
     horizons = (1, 5, 20) if return_count == 3 else tuple(range(1, return_count + 1))
     return StageBModule(
         encoder,
-        StageBConfig(horizons=horizons, initial_freeze_steps=0),
+        StageBConfig(horizons=horizons),
     )
 
 

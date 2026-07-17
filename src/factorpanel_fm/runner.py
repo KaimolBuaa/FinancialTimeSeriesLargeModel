@@ -16,7 +16,12 @@ from torch import nn
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import FactorPanelSample
-from .training import StageAModule, StageBModule
+from .training import (
+    StageAModule,
+    StageBModule,
+    build_stage_b_optimizer,
+    update_stage_b_optimizer,
+)
 
 
 @dataclass(frozen=True)
@@ -84,13 +89,17 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class RunSummary:
-    """Machine-readable result of a local runtime invocation."""
+    """Machine-readable result of a local runtime invocation.
+
+    ``micro_steps`` and ``consumed_samples`` are cumulative across resumed runs.
+    """
 
     stage: str
     model: str
     start_step: int
     step: int
     micro_steps: int
+    consumed_samples: int
     final_loss: float
     device: str
     param_count: int
@@ -222,10 +231,70 @@ def _validate_stage_module(module: nn.Module, stage: str) -> None:
         raise TypeError(f"stage {stage} requires {expected.__name__}")
 
 
-def _checkpoint_metadata(config: RuntimeConfig) -> dict[str, object]:
+def _rng_metadata() -> dict[str, object]:
+    cuda_states = (
+        [state.cpu().tolist() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else []
+    )
+    mps_state = (
+        torch.mps.get_rng_state().cpu().tolist()
+        if torch.backends.mps.is_available()
+        else None
+    )
+    return {
+        "python_rng_state": random.getstate(),
+        "torch_cpu_rng_state": torch.get_rng_state().cpu().tolist(),
+        "cuda_rng_states": cuda_states,
+        "mps_rng_state": mps_state,
+    }
+
+
+def _as_tuple(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_as_tuple(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_as_tuple(item) for item in value)
+    return value
+
+
+def _restore_rng(metadata: dict[str, object]) -> None:
+    python_state = metadata.get("python_rng_state")
+    cpu_state = metadata.get("torch_cpu_rng_state")
+    cuda_states = metadata.get("cuda_rng_states")
+    mps_state = metadata.get("mps_rng_state")
+    if not isinstance(python_state, (list, tuple)):
+        raise ValueError("checkpoint is missing python_rng_state")
+    if not isinstance(cpu_state, list) or not all(
+        isinstance(value, int) for value in cpu_state
+    ):
+        raise ValueError("checkpoint is missing torch_cpu_rng_state")
+    if not isinstance(cuda_states, list):
+        raise ValueError("checkpoint cuda_rng_states must be a list")
+    if mps_state is not None and not isinstance(mps_state, list):
+        raise ValueError("checkpoint mps_rng_state must be a list or null")
+    random.setstate(_as_tuple(python_state))
+    torch.set_rng_state(torch.tensor(cpu_state, dtype=torch.uint8))
+    if torch.cuda.is_available() and cuda_states:
+        torch.cuda.set_rng_state_all(
+            [torch.tensor(state, dtype=torch.uint8) for state in cuda_states]
+        )
+    if torch.backends.mps.is_available() and mps_state is not None:
+        torch.mps.set_rng_state(torch.tensor(mps_state, dtype=torch.uint8))
+
+
+def _checkpoint_metadata(
+    config: RuntimeConfig,
+    *,
+    consumed_samples: int,
+    micro_steps_total: int,
+) -> dict[str, object]:
     return {
         "stage": config.stage,
         "runtime_config": asdict(config),
+        "consumed_samples": consumed_samples,
+        "micro_steps_total": micro_steps_total,
+        **_rng_metadata(),
     }
 
 
@@ -238,6 +307,34 @@ def _checkpoint_stage(path: Path) -> str | None:
         raise ValueError("checkpoint metadata must be a dictionary")
     stage = metadata.get("stage")
     return stage if isinstance(stage, str) else None
+
+
+def _set_optimizer_step_lrs(
+    module: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: RuntimeConfig,
+    *,
+    step: int,
+) -> None:
+    """Compose the stage base/freeze rates with the runtime schedule."""
+
+    warmup_steps = min(
+        config.max_steps, math.ceil(config.max_steps * config.warmup_ratio)
+    )
+    multiplier = warmup_cosine_multiplier(
+        step,
+        warmup_steps=warmup_steps,
+        total_steps=config.max_steps,
+    )
+    if config.stage == "b":
+        if not isinstance(module, StageBModule):
+            raise TypeError("stage b requires StageBModule")
+        update_stage_b_optimizer(module, optimizer, step)
+        for group in optimizer.param_groups:
+            group["lr"] = float(group["lr"]) * multiplier
+        return
+    for group in optimizer.param_groups:
+        group["lr"] = float(config.lr) * multiplier
 
 
 def run_training(
@@ -261,6 +358,11 @@ def run_training(
         raise ValueError("resume requires checkpoint_path")
     if resume and not destination.is_file():
         raise ValueError(f"checkpoint_path does not exist: {destination}")
+    samples = _CyclingSamples(data)
+    if resume and samples.is_iterator:
+        raise ValueError(
+            "resume does not support a one-shot iterator; provide a replayable iterable"
+        )
 
     device = resolve_device(config.device)
     random.seed(config.seed)
@@ -269,24 +371,27 @@ def run_training(
         torch.cuda.manual_seed_all(config.seed)
         torch.cuda.reset_peak_memory_stats(device)
     module.to(device)
-    optimizer = torch.optim.AdamW(
-        module.parameters(),
-        lr=float(config.lr),
-        weight_decay=float(config.weight_decay),
-    )
-    warmup_steps = min(
-        config.max_steps, math.ceil(config.max_steps * config.warmup_ratio)
-    )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda position: warmup_cosine_multiplier(
-            position,
-            warmup_steps=warmup_steps,
-            total_steps=config.max_steps,
-        ),
-    )
+    if isinstance(module, StageBModule):
+        if module.config.base_lr != float(config.lr):
+            raise ValueError(
+                "RuntimeConfig.lr must equal StageBConfig.base_lr so freeze groups stay coherent"
+            )
+        optimizer = build_stage_b_optimizer(
+            module,
+            step=0,
+            weight_decay=float(config.weight_decay),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            module.parameters(),
+            lr=float(config.lr),
+            weight_decay=float(config.weight_decay),
+        )
 
     start_step = 0
+    consumed_samples = 0
+    micro_steps_total = 0
+    resume_metadata: dict[str, object] | None = None
     if resume:
         assert destination is not None
         checkpoint_stage = _checkpoint_stage(destination)
@@ -298,24 +403,36 @@ def run_training(
             destination, module, optimizer=optimizer, map_location=device
         )
         start_step = info.step
-        scheduler.last_epoch = start_step
         if start_step >= config.max_steps:
             raise ValueError("checkpoint step must be less than max_steps")
+        resume_metadata = info.metadata
+        consumed_value = resume_metadata.get("consumed_samples")
+        micro_steps_value = resume_metadata.get("micro_steps_total")
+        if isinstance(consumed_value, bool) or not isinstance(consumed_value, Integral):
+            raise ValueError("checkpoint consumed_samples must be an integer")
+        if isinstance(micro_steps_value, bool) or not isinstance(
+            micro_steps_value, Integral
+        ):
+            raise ValueError("checkpoint micro_steps_total must be an integer")
+        if consumed_value < 0 or micro_steps_value < 0:
+            raise ValueError("checkpoint sample counters must be nonnegative")
+        consumed_samples = int(consumed_value)
+        micro_steps_total = int(micro_steps_value)
+        for _ in range(consumed_samples):
+            samples.next()
+        _restore_rng(resume_metadata)
 
-    samples = _CyclingSamples(data)
-    first_sample = samples.next()
-    pending: FactorPanelSample | None = first_sample
     bf16_enabled = _bf16_supported(device, config.bf16)
     optimizer.zero_grad(set_to_none=True)
     step = start_step
-    micro_steps = 0
     final_loss = float("nan")
     started = time.perf_counter()
     while step < config.max_steps:
+        _set_optimizer_step_lrs(module, optimizer, config, step=step)
         accumulated_loss = 0.0
         for _ in range(config.gradient_accumulation):
-            sample = pending if pending is not None else samples.next()
-            pending = None
+            sample = samples.next()
+            consumed_samples += 1
             if sample.batch.batch_size > config.micro_batch_size:
                 raise ValueError(
                     "sample batch size exceeds configured micro_batch_size"
@@ -345,11 +462,10 @@ def run_training(
                 raise RuntimeError("training loss is not finite")
             (loss / config.gradient_accumulation).backward()
             accumulated_loss += float(loss.detach().cpu())
-            micro_steps += 1
+            micro_steps_total += 1
         torch.nn.utils.clip_grad_norm_(module.parameters(), float(config.grad_clip))
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
         step += 1
         final_loss = accumulated_loss / config.gradient_accumulation
         if destination is not None and step % config.checkpoint_every == 0:
@@ -358,7 +474,11 @@ def run_training(
                 module,
                 optimizer,
                 step,
-                metadata=_checkpoint_metadata(config),
+                metadata=_checkpoint_metadata(
+                    config,
+                    consumed_samples=consumed_samples,
+                    micro_steps_total=micro_steps_total,
+                ),
             )
 
     if destination is not None and (
@@ -369,7 +489,11 @@ def run_training(
             module,
             optimizer,
             step,
-            metadata=_checkpoint_metadata(config),
+            metadata=_checkpoint_metadata(
+                config,
+                consumed_samples=consumed_samples,
+                micro_steps_total=micro_steps_total,
+            ),
         )
     elapsed = time.perf_counter() - started
     peak_memory = (
@@ -380,7 +504,8 @@ def run_training(
         model=config.model,
         start_step=start_step,
         step=step,
-        micro_steps=micro_steps,
+        micro_steps=micro_steps_total,
+        consumed_samples=consumed_samples,
         final_loss=final_loss,
         device=str(device),
         param_count=sum(parameter.numel() for parameter in module.parameters()),

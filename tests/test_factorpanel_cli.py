@@ -54,6 +54,17 @@ class FactorPanelCliTests(unittest.TestCase):
                     self.assertEqual(summary["step"], 1)
                     self.assertEqual(summary["device"], "cpu")
                     self.assertTrue(checkpoint.is_file())
+                    if stage == "b":
+                        payload = torch.load(checkpoint, weights_only=True)
+                        groups = payload["optimizer_state"]["param_groups"]
+                        self.assertEqual(len(groups), 4)
+                        self.assertTrue(
+                            all(
+                                group["lr"] == 0.0
+                                for group in groups
+                                if group["stage_b_lower"]
+                            )
+                        )
 
     def test_pilot_reads_parquet_and_runs_one_step(self) -> None:
         factor_rows = []
@@ -165,6 +176,19 @@ class FactorPanelSmallConfigTests(unittest.TestCase):
         self.assertTrue(pilot["bf16"])
         self.assertEqual(pilot["pilot_steps"], 20000)
         self.assertEqual(pilot["max_steps"], 200000)
+
+    def test_environment_records_reproducible_runtime_without_qlib(self) -> None:
+        import yaml
+
+        environment = yaml.safe_load((ROOT / "environment.yml").read_text())
+        self.assertEqual(environment["name"], "factorpanel-fm")
+        dependencies = environment["dependencies"]
+        self.assertIn("python=3.11", dependencies)
+        pip = next(item["pip"] for item in dependencies if isinstance(item, dict))
+        self.assertIn("torch==2.9.1", pip)
+        self.assertIn("pandas==2.3.3", pip)
+        self.assertIn("pyarrow==22.0.0", pip)
+        self.assertFalse(any("qlib" in dependency.lower() for dependency in pip))
 
 
 if __name__ == "__main__":
