@@ -56,6 +56,8 @@ class ModelConfig:
             raise ValueError("context_length must be at least patch_size")
         if (self.context_length - self.patch_size) % self.patch_stride != 0:
             raise ValueError("patches must exactly cover context_length")
+        if self.input_channels != 3:
+            raise ValueError("input_channels must be 3 for the current input view contract")
         if self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         if (self.d_model // self.num_heads) % 2 != 0:
@@ -302,8 +304,9 @@ class FactorPanelEncoder(nn.Module):
         self.temporal_blocks = nn.ModuleList(
             _TemporalBlock(self.config) for _ in range(self.config.temporal_layers)
         )
+        num_set_blocks = self.config.set_layers if self.config.use_set_mixer else 0
         self.set_blocks = nn.ModuleList(
-            _InducedSetBlock(self.config) for _ in range(self.config.set_layers)
+            _InducedSetBlock(self.config) for _ in range(num_set_blocks)
         )
         self.pool_score = nn.Linear(self.config.d_model, 1, bias=False)
         self.output_projection = nn.Sequential(
@@ -334,6 +337,11 @@ class FactorPanelEncoder(nn.Module):
             raise ValueError("input views must match batch shape")
         if views.rank_gaussian.device != batch.values.device:
             raise ValueError("input views and batch must be on the same device")
+        observed = views.observed_mask
+        for numeric_view in (views.rank_gaussian, views.robust_z):
+            finite_observed = torch.isfinite(numeric_view) | ~observed
+            if not finite_observed.all().item():
+                raise ValueError("observed numeric input views must be finite")
         if patch_mask is not None:
             expected = (batch.batch_size, batch.num_assets, self.config.num_patches)
             if not isinstance(patch_mask, torch.Tensor):
@@ -351,7 +359,15 @@ class FactorPanelEncoder(nn.Module):
         views: InputViews,
         patch_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        channels = torch.nan_to_num(views.stacked).permute(0, 2, 1, 3)
+        observed = views.observed_mask
+        channels = torch.stack(
+            (
+                torch.where(observed, views.rank_gaussian, 0.0),
+                torch.where(observed, views.robust_z, 0.0),
+                observed.to(dtype=views.rank_gaussian.dtype),
+            ),
+            dim=-1,
+        ).permute(0, 2, 1, 3)
         if channels.shape[-1] != self.config.input_channels:
             raise ValueError(
                 f"input views provide {channels.shape[-1]} channels, "
@@ -371,13 +387,14 @@ class FactorPanelEncoder(nn.Module):
         )
         patch_valid = observed.any(dim=-1)
         states = self.patch_projection(patches) * patch_valid.unsqueeze(-1)
-        if patch_mask is not None:
-            replace_mask = patch_mask & patch_valid
-            states = torch.where(
-                replace_mask.unsqueeze(-1),
-                self.mask_token.view(1, 1, 1, -1),
-                states,
-            )
+        replace_mask = (
+            torch.zeros_like(patch_valid) if patch_mask is None else patch_mask & patch_valid
+        )
+        states = torch.where(
+            replace_mask.unsqueeze(-1),
+            self.mask_token.view(1, 1, 1, -1),
+            states,
+        )
         return states, patch_valid
 
     @staticmethod

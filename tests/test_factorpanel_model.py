@@ -12,6 +12,7 @@ from factorpanel_fm import (
     EncoderOutput,
     FactorPanelBatch,
     FactorPanelEncoder,
+    InputViews,
     ModelConfig,
     build_input_views,
 )
@@ -64,6 +65,10 @@ class ModelConfigTests(unittest.TestCase):
     def test_rejects_patch_geometry_that_drops_trailing_timesteps(self) -> None:
         with self.assertRaisesRegex(ValueError, "cover"):
             ModelConfig(context_length=257)
+
+    def test_rejects_non_three_channel_input_config(self) -> None:
+        with self.assertRaisesRegex(ValueError, "3"):
+            ModelConfig.tiny(input_channels=4)
 
 
 class FactorPanelEncoderTests(unittest.TestCase):
@@ -171,6 +176,44 @@ class FactorPanelEncoderTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.model(batch, patch_mask=patch_mask.float())
 
+    def test_missing_numeric_view_fillers_do_not_affect_outputs(self) -> None:
+        batch = self.make_batch(batch_size=1, num_assets=3)
+        mask = torch.ones_like(batch.observed_mask)
+        mask[:, 0, 0] = False
+        rank = torch.randn_like(batch.values)
+        robust = torch.randn_like(batch.values)
+        zero_filled = InputViews(
+            rank_gaussian=rank.masked_fill(~mask, 0.0),
+            robust_z=robust.masked_fill(~mask, 0.0),
+            observed_mask=mask,
+        )
+        arbitrary_filled = InputViews(
+            rank_gaussian=rank.masked_fill(~mask, float("inf")),
+            robust_z=robust.masked_fill(~mask, -12345.0),
+            observed_mask=mask,
+        )
+
+        expected = self.model(batch, views=zero_filled)
+        actual = self.model(batch, views=arbitrary_filled)
+
+        self.assertTrue(torch.isfinite(actual.features).all())
+        torch.testing.assert_close(actual.features, expected.features)
+        torch.testing.assert_close(actual.factor_embedding, expected.factor_embedding)
+
+    def test_rejects_nonfinite_observed_numeric_view_values(self) -> None:
+        batch = self.make_batch(batch_size=1, num_assets=3)
+        mask = torch.ones_like(batch.observed_mask)
+        rank = torch.zeros_like(batch.values)
+        rank[:, 0, 0] = float("inf")
+        views = InputViews(
+            rank_gaussian=rank,
+            robust_z=torch.zeros_like(batch.values),
+            observed_mask=mask,
+        )
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            self.model(batch, views=views)
+
     def test_temporal_only_ablation_uses_same_output_contract(self) -> None:
         config = ModelConfig.tiny(dropout=0.0, use_set_mixer=False)
         model = FactorPanelEncoder(config).eval()
@@ -181,6 +224,34 @@ class FactorPanelEncoderTests(unittest.TestCase):
         self.assertEqual(output.factor_embedding.shape, (2, config.output_dim))
         self.assertTrue(torch.isfinite(output.features).all())
         self.assertEqual(torch.count_nonzero(output.features[0, -1]).item(), 0)
+
+    def test_backward_reaches_every_full_model_parameter_without_patch_mask(self) -> None:
+        output = self.model(self.make_batch(batch_size=1, num_assets=3))
+
+        (output.features.square().mean() + output.factor_embedding.square().mean()).backward()
+
+        missing = [
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
+
+    def test_temporal_ablation_has_no_set_parameters_and_all_receive_gradients(self) -> None:
+        config = ModelConfig.tiny(dropout=0.0, use_set_mixer=False)
+        model = FactorPanelEncoder(config).eval()
+        self.assertEqual(len(model.set_blocks), 0)
+        self.assertFalse(any(name.startswith("set_blocks") for name, _ in model.named_parameters()))
+
+        output = model(self.make_batch(batch_size=1, num_assets=3))
+        (output.features.square().mean() + output.factor_embedding.square().mean()).backward()
+
+        missing = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
 
     def test_rejects_input_context_mismatch(self) -> None:
         length = self.config.context_length - 1
