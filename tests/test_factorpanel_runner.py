@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 import torch
+from torch.utils.data import DataLoader
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,7 @@ from factorpanel_fm import (  # noqa: E402
     StageBModule,
     auto_micro_batch_probe,
     build_stage_b_optimizer,
+    collate_factor_samples,
     resolve_device,
     run_training,
     warmup_cosine_multiplier,
@@ -350,6 +352,112 @@ class RunTrainingTests(unittest.TestCase):
                         checkpoint_path=checkpoint,
                         resume=True,
                     )
+                with self.assertRaisesRegex(ValueError, "deterministic replay"):
+                    run_training(
+                        resumed,
+                        InterruptAfter(samples, count=1),
+                        runtime,
+                        checkpoint_path=checkpoint,
+                        resume=True,
+                    )
+
+    def test_resume_rejects_random_dataloader(self) -> None:
+        samples = [make_sample(51, 16), make_sample(53, 17)]
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "random-loader.pt"
+            run_training(
+                StageAModule(FactorPanelEncoder(ModelConfig.tiny())),
+                samples,
+                RuntimeConfig(
+                    stage="a",
+                    max_steps=1,
+                    gradient_accumulation=1,
+                    checkpoint_every=1,
+                    device="cpu",
+                    bf16=False,
+                ),
+                checkpoint_path=checkpoint,
+            )
+            random_loader = DataLoader(
+                samples,
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
+                collate_fn=collate_factor_samples,
+            )
+            with self.assertRaisesRegex(ValueError, "SequentialSampler"):
+                run_training(
+                    StageAModule(FactorPanelEncoder(ModelConfig.tiny())),
+                    random_loader,
+                    RuntimeConfig(
+                        stage="a",
+                        max_steps=2,
+                        gradient_accumulation=1,
+                        device="cpu",
+                        bf16=False,
+                    ),
+                    checkpoint_path=checkpoint,
+                    resume=True,
+                )
+
+    def test_sequential_dataloader_resume_matches_continuous(self) -> None:
+        samples = [make_sample(61, 16), make_sample(67, 17)]
+        runtime = RuntimeConfig(
+            stage="a",
+            max_steps=4,
+            gradient_accumulation=1,
+            warmup_ratio=0.25,
+            checkpoint_every=1,
+            device="cpu",
+            bf16=False,
+            seed=109,
+        )
+        torch.manual_seed(223)
+        config = ModelConfig.tiny(dropout=0.2)
+        initial = copy.deepcopy(StageAModule(FactorPanelEncoder(config)).state_dict())
+        continuous = StageAModule(FactorPanelEncoder(config))
+        continuous.load_state_dict(initial)
+        continuous_loader = DataLoader(
+            samples,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_factor_samples,
+        )
+        run_training(continuous, continuous_loader, runtime)
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sequential-loader.pt"
+            interrupted = StageAModule(FactorPanelEncoder(config))
+            interrupted.load_state_dict(initial)
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                run_training(
+                    interrupted,
+                    InterruptAfter(samples, count=1),
+                    runtime,
+                    checkpoint_path=checkpoint,
+                )
+            resumed = StageAModule(FactorPanelEncoder(config))
+            resumed.load_state_dict(initial)
+            resume_loader = DataLoader(
+                samples,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=collate_factor_samples,
+            )
+            run_training(
+                resumed,
+                resume_loader,
+                runtime,
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+
+        for name, expected in continuous.state_dict().items():
+            torch.testing.assert_close(
+                resumed.state_dict()[name], expected, rtol=0, atol=0
+            )
 
     def test_stage_b_lower_blocks_stay_frozen_then_update_at_boundary(self) -> None:
         samples = [make_sample(41, 16), make_sample(43, 17)]

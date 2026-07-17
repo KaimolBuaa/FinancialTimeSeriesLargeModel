@@ -175,6 +175,26 @@ class PanelFrameDatasetTests(unittest.TestCase):
         )
         self.assertEqual(len(short), 0)
 
+    def test_empty_future_horizons_keep_all_stage_b_decision_dates(self) -> None:
+        factors = pd.DataFrame(
+            {
+                "date": [date for date in range(1, 37) for _ in range(2)],
+                "asset": [asset for _ in range(1, 37) for asset in ("A", "B")],
+                "value": [float(date) for date in range(1, 37) for _ in range(2)],
+            }
+        )
+        dataset = PanelFrameDataset(
+            factors,
+            context_length=16,
+            future_horizons=(),
+            factor_columns=("value",),
+        )
+
+        self.assertEqual(len(dataset), 21)
+        self.assertEqual(dataset[-1].decision_date, 36)
+        self.assertEqual(dataset[-1].future_factor_targets.shape, (1, 2, 0))
+        self.assertEqual(dataset[-1].future_factor_mask.shape, (1, 2, 0))
+
     def test_from_parquet_matches_frame_adapter(self) -> None:
         factors, labels = self.frames()
         with tempfile.TemporaryDirectory() as directory:

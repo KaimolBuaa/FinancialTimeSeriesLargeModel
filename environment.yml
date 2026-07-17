@@ -12,3 +12,4 @@ dependencies:
       - pyarrow==22.0.0
       - pyyaml==6.0.3
       - ruff==0.14.10
+      - -e .

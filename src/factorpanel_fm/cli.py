@@ -28,19 +28,37 @@ def _csv_columns(value: str) -> tuple[str, ...]:
     return columns
 
 
+def _positive_int_csv(value: str) -> tuple[int, ...]:
+    try:
+        horizons = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "horizons must be comma-separated integers"
+        ) from error
+    if not horizons or any(horizon <= 0 for horizon in horizons):
+        raise argparse.ArgumentTypeError("horizons must contain positive integers")
+    if len(horizons) != len(set(horizons)):
+        raise argparse.ArgumentTypeError("horizons must not contain duplicates")
+    return horizons
+
+
 def _model_config(name: str, context_length: int | None = None) -> ModelConfig:
     factory = ModelConfig.tiny if name == "tiny" else ModelConfig.small
     overrides = {} if context_length is None else {"context_length": context_length}
     return factory(**overrides)
 
 
-def _module(stage: str, config: ModelConfig, return_count: int = 3) -> torch.nn.Module:
+def _module(
+    stage: str,
+    config: ModelConfig,
+    return_horizons: Sequence[int],
+) -> torch.nn.Module:
     encoder = FactorPanelEncoder(config)
     if stage == "a":
         return StageAModule(encoder)
-    if return_count <= 0:
-        raise ValueError("Stage B requires labels and nonempty --return-columns")
-    horizons = (1, 5, 20) if return_count == 3 else tuple(range(1, return_count + 1))
+    horizons = tuple(return_horizons)
+    if not horizons:
+        raise ValueError("Stage B requires explicit return horizons")
     return StageBModule(
         encoder,
         StageBConfig(horizons=horizons),
@@ -75,7 +93,8 @@ def _synthetic_sample(config: ModelConfig, seed: int) -> FactorPanelSample:
 def _run_smoke(arguments: argparse.Namespace) -> RunSummary:
     torch.manual_seed(arguments.seed)
     model_config = ModelConfig.tiny()
-    module = _module(arguments.stage, model_config)
+    return_horizons = (1, 5, 20) if arguments.stage == "b" else ()
+    module = _module(arguments.stage, model_config, return_horizons)
     runtime = RuntimeConfig(
         stage=arguments.stage,
         model="tiny",
@@ -106,6 +125,14 @@ def _run_pilot(arguments: argparse.Namespace) -> RunSummary:
         raise ValueError("--resume requires --checkpoint")
     if arguments.stage == "b" and (labels_path is None or not arguments.return_columns):
         raise ValueError("Stage B requires --labels and --return-columns")
+    if arguments.stage == "b" and arguments.return_horizons is None:
+        raise ValueError("Stage B requires --return-horizons")
+    if arguments.stage == "b" and len(arguments.return_horizons) != len(
+        arguments.return_columns
+    ):
+        raise ValueError(
+            "--return-horizons and --return-columns must have the same length"
+        )
 
     torch.manual_seed(arguments.seed)
     model_config = _model_config(arguments.model, arguments.context_length)
@@ -113,6 +140,7 @@ def _run_pilot(arguments: argparse.Namespace) -> RunSummary:
         factors_path,
         labels_path,
         context_length=model_config.context_length,
+        future_horizons=(5, 20) if arguments.stage == "a" else (),
         factor_columns=arguments.factor_columns,
         return_columns=arguments.return_columns or (),
     )
@@ -125,7 +153,11 @@ def _run_pilot(arguments: argparse.Namespace) -> RunSummary:
         num_workers=0,
         collate_fn=collate_factor_samples,
     )
-    module = _module(arguments.stage, model_config, len(dataset.return_columns))
+    module = _module(
+        arguments.stage,
+        model_config,
+        arguments.return_horizons or (),
+    )
     runtime = RuntimeConfig(
         stage=arguments.stage,
         model=arguments.model,
@@ -167,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     pilot.add_argument("--labels")
     pilot.add_argument("--factor-columns", type=_csv_columns, required=True)
     pilot.add_argument("--return-columns", type=_csv_columns)
+    pilot.add_argument("--return-horizons", type=_positive_int_csv)
     pilot.add_argument("--stage", choices=("a", "b"), required=True)
     pilot.add_argument("--model", choices=("tiny", "small"), default="small")
     pilot.add_argument("--context-length", type=int)

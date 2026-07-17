@@ -169,7 +169,7 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         horizons = tuple(future_horizons)
-        if not horizons or any(
+        if any(
             isinstance(value, bool) or not isinstance(value, Integral) or value <= 0
             for value in horizons
         ):
@@ -252,7 +252,11 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
         self.dates = _date_codes(date_values)
         self.asset_ids = torch.arange(len(asset_values), dtype=torch.int64)
         self.asset_values = tuple(asset_values.tolist())
-        last_decision = len(date_values) - max(self.future_horizons) - 1
+        last_decision = (
+            len(date_values) - max(self.future_horizons) - 1
+            if self.future_horizons
+            else len(date_values) - 1
+        )
         self._decision_positions = tuple(
             range(self.context_length - 1, last_decision + 1, self.stride)
         )
@@ -286,13 +290,17 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
         start = decision_position - self.context_length + 1
         values = self._factors[start : decision_position + 1, :, factor_index]
         observed = self._factor_mask[start : decision_position + 1, :, factor_index]
-        future_positions = [
-            decision_position + horizon for horizon in self.future_horizons
-        ]
-        future = self._factors[future_positions, :, factor_index].transpose(0, 1)
-        future_mask = self._factor_mask[future_positions, :, factor_index].transpose(
-            0, 1
-        )
+        if self.future_horizons:
+            future_positions = [
+                decision_position + horizon for horizon in self.future_horizons
+            ]
+            future = self._factors[future_positions, :, factor_index].transpose(0, 1)
+            future_mask = self._factor_mask[
+                future_positions, :, factor_index
+            ].transpose(0, 1)
+        else:
+            future = torch.empty(self.asset_ids.numel(), 0, dtype=self._factors.dtype)
+            future_mask = torch.empty(self.asset_ids.numel(), 0, dtype=torch.bool)
         returns = self._returns[decision_position]
         return_mask = self._return_mask[decision_position]
         decision_date = int(self.dates[decision_position].item())

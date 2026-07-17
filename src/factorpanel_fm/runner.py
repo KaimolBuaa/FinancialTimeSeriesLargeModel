@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator as IteratorABC
+from collections.abc import Sequence as SequenceABC
 from dataclasses import asdict, dataclass
 import math
 from numbers import Integral, Real
@@ -13,6 +15,7 @@ from typing import Callable, Iterable, Iterator
 
 import torch
 from torch import nn
+from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import FactorPanelSample
@@ -285,6 +288,7 @@ def _restore_rng(metadata: dict[str, object]) -> None:
 
 def _checkpoint_metadata(
     config: RuntimeConfig,
+    module: nn.Module,
     *,
     consumed_samples: int,
     micro_steps_total: int,
@@ -292,21 +296,43 @@ def _checkpoint_metadata(
     return {
         "stage": config.stage,
         "runtime_config": asdict(config),
+        "stage_config": asdict(module.config),
         "consumed_samples": consumed_samples,
         "micro_steps_total": micro_steps_total,
         **_rng_metadata(),
     }
 
 
-def _checkpoint_stage(path: Path) -> str | None:
+def _saved_checkpoint_metadata(path: Path) -> dict[str, object]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint payload must be a dictionary")
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint metadata must be a dictionary")
-    stage = metadata.get("stage")
-    return stage if isinstance(stage, str) else None
+    return metadata
+
+
+def _validate_resume_source(
+    data: Iterable[FactorPanelSample] | Iterator[FactorPanelSample],
+) -> None:
+    if isinstance(data, DataLoader):
+        if data.num_workers != 0:
+            raise ValueError("resume requires a DataLoader with num_workers=0")
+        if not isinstance(data.sampler, SequentialSampler):
+            raise ValueError("resume requires a DataLoader with SequentialSampler")
+        if type(data.batch_sampler) is not BatchSampler:
+            raise ValueError("resume requires the standard deterministic BatchSampler")
+        return
+    if isinstance(data, SequenceABC):
+        return
+    if isinstance(data, IteratorABC):
+        raise ValueError(
+            "resume does not support a one-shot iterator; provide a replayable Sequence"
+        )
+    raise ValueError(
+        "resume requires a deterministic replay source: a Sequence or sequential DataLoader"
+    )
 
 
 def _set_optimizer_step_lrs(
@@ -358,11 +384,9 @@ def run_training(
         raise ValueError("resume requires checkpoint_path")
     if resume and not destination.is_file():
         raise ValueError(f"checkpoint_path does not exist: {destination}")
+    if resume:
+        _validate_resume_source(data)
     samples = _CyclingSamples(data)
-    if resume and samples.is_iterator:
-        raise ValueError(
-            "resume does not support a one-shot iterator; provide a replayable iterable"
-        )
 
     device = resolve_device(config.device)
     random.seed(config.seed)
@@ -394,10 +418,15 @@ def run_training(
     resume_metadata: dict[str, object] | None = None
     if resume:
         assert destination is not None
-        checkpoint_stage = _checkpoint_stage(destination)
+        saved_metadata = _saved_checkpoint_metadata(destination)
+        checkpoint_stage = saved_metadata.get("stage")
         if checkpoint_stage != config.stage:
             raise ValueError(
                 f"checkpoint stage {checkpoint_stage!r} does not match runtime stage {config.stage!r}"
+            )
+        if saved_metadata.get("stage_config") != asdict(module.config):
+            raise ValueError(
+                "checkpoint stage_config does not match the runtime module config"
             )
         info = load_checkpoint(
             destination, module, optimizer=optimizer, map_location=device
@@ -476,6 +505,7 @@ def run_training(
                 step,
                 metadata=_checkpoint_metadata(
                     config,
+                    module,
                     consumed_samples=consumed_samples,
                     micro_steps_total=micro_steps_total,
                 ),
@@ -491,6 +521,7 @@ def run_training(
             step,
             metadata=_checkpoint_metadata(
                 config,
+                module,
                 consumed_samples=consumed_samples,
                 micro_steps_total=micro_steps_total,
             ),

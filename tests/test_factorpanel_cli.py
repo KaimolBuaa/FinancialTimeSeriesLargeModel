@@ -11,6 +11,10 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from factorpanel_fm.cli import _module  # noqa: E402
+from factorpanel_fm.model import ModelConfig  # noqa: E402
 
 
 def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -58,6 +62,10 @@ class FactorPanelCliTests(unittest.TestCase):
                         payload = torch.load(checkpoint, weights_only=True)
                         groups = payload["optimizer_state"]["param_groups"]
                         self.assertEqual(len(groups), 4)
+                        self.assertEqual(
+                            payload["metadata"]["stage_config"]["horizons"],
+                            (1, 5, 20),
+                        )
                         self.assertTrue(
                             all(
                                 group["lr"] == 0.0
@@ -100,6 +108,8 @@ class FactorPanelCliTests(unittest.TestCase):
                 "alpha",
                 "--return-columns",
                 "r1,r5,r20",
+                "--return-horizons",
+                "1,5,20",
                 "--stage",
                 "b",
                 "--model",
@@ -117,11 +127,38 @@ class FactorPanelCliTests(unittest.TestCase):
             )
             checkpoint_created = checkpoint.is_file()
 
+            mismatch = run_cli(
+                "pilot",
+                "--factors",
+                str(factors),
+                "--labels",
+                str(labels),
+                "--factor-columns",
+                "alpha",
+                "--return-columns",
+                "r1,r5,r20",
+                "--return-horizons",
+                "1,5",
+                "--stage",
+                "b",
+                "--model",
+                "tiny",
+                "--steps",
+                "1",
+            )
+
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads(result.stdout)
         self.assertEqual(summary["step"], 1)
         self.assertEqual(summary["model"], "tiny")
         self.assertTrue(checkpoint_created)
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("same length", mismatch.stderr)
+
+    def test_stage_b_module_uses_explicit_return_horizons(self) -> None:
+        module = _module("b", ModelConfig.tiny(), (2, 7, 30))
+
+        self.assertEqual(module.config.horizons, (2, 7, 30))
 
     def test_bad_pilot_input_is_nonzero_and_clear(self) -> None:
         result = run_cli(
@@ -188,7 +225,30 @@ class FactorPanelSmallConfigTests(unittest.TestCase):
         self.assertIn("torch==2.9.1", pip)
         self.assertIn("pandas==2.3.3", pip)
         self.assertIn("pyarrow==22.0.0", pip)
+        self.assertIn("-e .", pip)
         self.assertFalse(any("qlib" in dependency.lower() for dependency in pip))
+
+    def test_pyproject_declares_src_packages_and_core_dependencies(self) -> None:
+        import tomllib
+
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertGreaterEqual(project["project"]["requires-python"], ">=3.11")
+        dependencies = project["project"]["dependencies"]
+        self.assertTrue(any(value.startswith("torch") for value in dependencies))
+        self.assertTrue(any(value.startswith("pandas") for value in dependencies))
+        self.assertTrue(any(value.startswith("pyarrow") for value in dependencies))
+        setuptools = project["tool"]["setuptools"]
+        self.assertEqual(
+            set(setuptools["packages"]),
+            {"factorpanel_fm", "factorpanel_data"},
+        )
+        self.assertEqual(
+            setuptools["package-dir"],
+            {
+                "factorpanel_fm": "src/factorpanel_fm",
+                "factorpanel_data": "src/factorpanel_data",
+            },
+        )
 
 
 if __name__ == "__main__":
