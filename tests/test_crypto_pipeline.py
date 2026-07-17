@@ -54,6 +54,18 @@ class CryptoPipelineTests(unittest.TestCase):
                 {"downloaded": 1, "missing": 1, "failed": 0},
             )
 
+    def test_cli_renders_bounded_progress_bar(self):
+        sys.path.insert(0, str(SRC))
+        module = importlib.import_module("factorpanel_data.cli")
+        self.assertEqual(
+            module.render_progress_bar(completed=40, total=80, width=10),
+            "[#####-----] 50.0% (40/80)",
+        )
+        self.assertEqual(
+            module.render_progress_bar(completed=99, total=80, width=4),
+            "[####] 100.0% (80/80)",
+        )
+
     @unittest.skipUnless(ARCHIVE.is_file(), "archive module has not been implemented")
     def test_archive_locations_and_storage_gate(self):
         sys.path.insert(0, str(SRC))
