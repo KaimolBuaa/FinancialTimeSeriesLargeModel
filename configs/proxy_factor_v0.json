@@ -1,0 +1,13 @@
+{
+  "provider_uri": "resources/data/qlib/cn_data",
+  "output_root": "resources/data/proxy_factor_v0",
+  "start_year": 2008,
+  "end_year": 2025,
+  "universe": "all",
+  "frequency": "day",
+  "warmup_trading_days": 120,
+  "factor_shard_size": 32,
+  "compression": "zstd",
+  "min_global_valid_ratio": 0.05,
+  "max_near_constant_ratio": 0.99
+}

@@ -1,5 +1,6 @@
 """Causal, versioned data preparation for FactorPanel-FM."""
 
+from .proxy_config import ProxyFactorConfig, load_proxy_config
 from .proxy_registry import (
     FACTOR_WINDOWS,
     PROXY_FACTOR_REGISTRY,
@@ -16,6 +17,8 @@ __all__ = [
     "PROXY_LABEL_REGISTRY",
     "FactorDefinition",
     "LabelDefinition",
+    "ProxyFactorConfig",
     "build_label_registry",
     "build_proxy_factor_registry",
+    "load_proxy_config",
 ]
