@@ -208,7 +208,7 @@ Expected: missing `ProxyFactorConfig` and query adapter.
 
 - [ ] **Step 3: Implement validated configuration**
 
-`ProxyFactorConfig` must reject years outside the local calendar, non-`all` universe values for v0, shard sizes that do not divide 128, missing provider paths, and output roots inside the Git worktree. Its fingerprint must be SHA-256 over canonical JSON containing the factor registry, label registry and all generation options.
+`ProxyFactorConfig` must reject years outside the local calendar, non-`all` universe values for v0, shard sizes that do not divide 128, missing provider paths, and output roots that overlap tracked source, test or configuration directories. The intended ignored output root `resources/data/proxy_factor_v0` is valid. Its fingerprint must be SHA-256 over canonical JSON containing the factor registry, label registry and all generation options.
 
 The authoritative JSON must contain:
 
