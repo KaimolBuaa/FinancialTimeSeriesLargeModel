@@ -9,6 +9,8 @@ from typing import Sequence
 import torch
 from torch.nn import functional as F
 
+from ._random import randint_for_device
+
 
 def _validate_matching_tensors(
     prediction: torch.Tensor,
@@ -111,8 +113,9 @@ def negative_cross_sectional_ic_loss(
         raise ValueError("scores, targets, and mask must have shape [B, N, H]")
     section_scores = scores.transpose(1, 2)
     section_targets = targets.transpose(1, 2)
-    valid = mask.transpose(1, 2)
-    valid &= torch.isfinite(section_scores) & torch.isfinite(section_targets)
+    valid = mask.transpose(1, 2) & torch.isfinite(section_scores) & torch.isfinite(
+        section_targets
+    )
     counts = valid.sum(dim=-1)
     denominator = counts.clamp_min(1).to(scores.dtype)
     score_mean = torch.where(valid, section_scores, 0.0).sum(dim=-1) / denominator
@@ -129,6 +132,35 @@ def negative_cross_sectional_ic_loss(
         torch.finfo(scores.dtype).tiny
     )
     return 1.0 - correlations[eligible].mean()
+
+
+def _sample_unordered_pairs(
+    valid_indices: torch.Tensor,
+    max_pairs: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Return exact small-section pairs or bounded sampled large-section pairs."""
+
+    count = valid_indices.numel()
+    total_pairs = count * (count - 1) // 2
+    if total_pairs <= max_pairs:
+        return torch.combinations(valid_indices, r=2)
+
+    start = randint_for_device(
+        total_pairs,
+        (1,),
+        valid_indices.device,
+        generator=generator,
+    )
+    pair_ranks = (
+        torch.arange(max_pairs, device=valid_indices.device, dtype=torch.int64) + start
+    ) % total_pairs
+    left_candidates = torch.arange(count, device=valid_indices.device, dtype=torch.int64)
+    row_starts = left_candidates * (2 * count - left_candidates - 1) // 2
+    left = torch.searchsorted(row_starts, pair_ranks, right=True) - 1
+    right = left + 1 + pair_ranks - row_starts[left]
+    position_pairs = torch.stack((left, right), dim=-1)
+    return valid_indices[position_pairs]
 
 
 def pairwise_logistic_loss(
@@ -154,13 +186,19 @@ def pairwise_logistic_loss(
     target_signs: list[torch.Tensor] = []
     for batch_index in range(scores.shape[0]):
         for horizon_index in range(scores.shape[2]):
-            section_valid = mask[batch_index, :, horizon_index]
-            section_valid &= torch.isfinite(scores[batch_index, :, horizon_index])
-            section_valid &= torch.isfinite(targets[batch_index, :, horizon_index])
+            section_valid = (
+                mask[batch_index, :, horizon_index]
+                & torch.isfinite(scores[batch_index, :, horizon_index])
+                & torch.isfinite(targets[batch_index, :, horizon_index])
+            )
             valid_indices = section_valid.nonzero(as_tuple=False).squeeze(-1)
             if valid_indices.numel() < 2:
                 continue
-            pairs = torch.combinations(valid_indices, r=2)
+            pairs = _sample_unordered_pairs(
+                valid_indices,
+                max_pairs,
+                generator=generator,
+            )
             left, right = pairs[:, 0], pairs[:, 1]
             target_difference = (
                 targets[batch_index, left, horizon_index]
@@ -171,15 +209,6 @@ def pairwise_logistic_loss(
                 continue
             left, right = left[unequal], right[unequal]
             target_difference = target_difference[unequal]
-            if left.numel() > max_pairs:
-                selected = torch.randperm(
-                    left.numel(),
-                    device=left.device,
-                    generator=generator,
-                )[:max_pairs]
-                left = left[selected]
-                right = right[selected]
-                target_difference = target_difference[selected]
             score_differences.append(
                 scores[batch_index, left, horizon_index]
                 - scores[batch_index, right, horizon_index]

@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ._random import randperm_for_device as _randperm_for_device
 from .batch import FactorPanelBatch
 from .losses import (
     masked_huber_loss,
@@ -95,6 +96,7 @@ class StageAOutput:
     future_quantiles: torch.Tensor
     patch_reconstruction: torch.Tensor
     patch_mask: torch.Tensor
+    encoder_patch_mask: torch.Tensor
 
 
 def _patch_valid_from_views(views: InputViews, encoder: FactorPanelEncoder) -> torch.Tensor:
@@ -144,7 +146,7 @@ def sample_patch_mask(
                 for start in range(0, len(run), 2):
                     spans.append((batch_index, asset_index, tuple(run[start : start + 2])))
 
-    order = torch.randperm(len(spans), generator=generator, device=patch_valid.device)
+    order = _randperm_for_device(len(spans), patch_valid.device, generator=generator)
     remaining = target_count
     for span_index in order.tolist():
         batch_index, asset_index, positions = spans[span_index]
@@ -169,6 +171,19 @@ def _patch_targets(views: InputViews, encoder: FactorPanelEncoder) -> tuple[torc
         encoder.config.patch_stride,
     )
     return targets, observed
+
+
+def _expand_patch_mask_for_overlap(
+    patch_mask: torch.Tensor,
+    patch_size: int,
+    patch_stride: int,
+) -> torch.Tensor:
+    """Mask every patch whose source interval overlaps a reconstruction target."""
+
+    starts = torch.arange(patch_mask.shape[-1], device=patch_mask.device) * patch_stride
+    ends = starts + patch_size
+    overlaps = (starts[:, None] < ends[None, :]) & (starts[None, :] < ends[:, None])
+    return (patch_mask.unsqueeze(-1) & overlaps).any(dim=-2)
 
 
 def _connected_zero(*tensors: torch.Tensor) -> torch.Tensor:
@@ -250,7 +265,12 @@ class StageAModule(nn.Module):
                 raise ValueError("patch_mask and batch must be on the same device")
             selected_mask = patch_mask & patch_valid
 
-        encoder_output = self.encoder(batch, views=views, patch_mask=selected_mask)
+        encoder_patch_mask = _expand_patch_mask_for_overlap(
+            selected_mask,
+            self.encoder.config.patch_size,
+            self.encoder.config.patch_stride,
+        ) & patch_valid
+        encoder_output = self.encoder(batch, views=views, patch_mask=encoder_patch_mask)
         reconstruction = self.patch_reconstruction_head(encoder_output.patch_states).unflatten(
             -1,
             (self.encoder.config.patch_size, 2),
@@ -281,13 +301,30 @@ class StageAModule(nn.Module):
         else:
             if not isinstance(second_batch, FactorPanelBatch):
                 raise TypeError("second_batch must be a FactorPanelBatch")
-            if (second_batch.batch_size, second_batch.num_assets) != (
-                batch.batch_size,
-                batch.num_assets,
+            if second_batch.batch_size != batch.batch_size:
+                raise ValueError("second_batch must match batch size")
+            if second_batch.dates.shape != batch.dates.shape or not torch.equal(
+                second_batch.dates,
+                batch.dates,
             ):
-                raise ValueError("second_batch must match batch and asset dimensions")
+                raise ValueError("second_batch dates must exactly match batch dates")
+            for name, asset_ids in (
+                ("batch", batch.asset_ids),
+                ("second_batch", second_batch.asset_ids),
+            ):
+                sorted_ids = asset_ids.sort(dim=-1).values
+                if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any().item():
+                    raise ValueError(f"{name} asset_ids must be unique within each batch")
             second_output = self.encoder(second_batch)
-            overlap = encoder_output.asset_valid & second_output.asset_valid
+            matches = batch.asset_ids.unsqueeze(-1) == second_batch.asset_ids.unsqueeze(-2)
+            has_match = matches.any(dim=-1)
+            second_indices = matches.to(torch.int64).argmax(dim=-1)
+            matched_features = second_output.features.gather(
+                1,
+                second_indices.unsqueeze(-1).expand(-1, -1, second_output.features.shape[-1]),
+            )
+            matched_valid = second_output.asset_valid.gather(1, second_indices)
+            overlap = encoder_output.asset_valid & has_match & matched_valid
             if overlap_mask is not None:
                 if not isinstance(overlap_mask, torch.Tensor):
                     raise TypeError("overlap_mask must be a torch.Tensor")
@@ -297,11 +334,11 @@ class StageAModule(nn.Module):
                     raise TypeError("overlap_mask must have bool dtype")
                 if overlap_mask.device != batch.values.device:
                     raise ValueError("overlap_mask and batch must be on the same device")
-                overlap &= overlap_mask
+                overlap = overlap & overlap_mask
             if overlap.any().item():
                 similarity = F.cosine_similarity(
                     encoder_output.features[overlap],
-                    second_output.features[overlap],
+                    matched_features[overlap],
                     dim=-1,
                 )
                 consistency_loss = (1.0 - similarity).mean()
@@ -315,6 +352,7 @@ class StageAModule(nn.Module):
             self.config.mask_weight * mask_loss
             + self.config.future_weight * future_factor_loss
             + self.config.consistency_weight * consistency_loss
+            + _connected_zero(encoder_output.factor_embedding, self.encoder.mask_token)
         )
         return StageAOutput(
             total_loss=total_loss,
@@ -325,6 +363,7 @@ class StageAModule(nn.Module):
             future_quantiles=future_quantiles,
             patch_reconstruction=reconstruction,
             patch_mask=selected_mask,
+            encoder_patch_mask=encoder_patch_mask,
         )
 
 
@@ -426,6 +465,7 @@ class StageBModule(nn.Module):
             self.config.ic_weight * ic_loss
             + self.config.pairwise_weight * pairwise_loss
             + self.config.huber_weight * huber_loss
+            + _connected_zero(encoder_output.factor_embedding, self.encoder.mask_token)
         )
         return StageBOutput(
             total_loss=total_loss,
@@ -469,31 +509,68 @@ def build_stage_b_optimizer(
     if not math.isfinite(float(weight_decay)) or weight_decay < 0:
         raise ValueError("weight_decay must be finite and nonnegative")
     configure_stage_b_trainability(module, step)
-    unfrozen = step >= module.config.initial_freeze_steps
+    frozen = step < module.config.initial_freeze_steps
     lower_prefixes = _lower_temporal_prefixes(module)
-    grouped: dict[tuple[float, float], list[nn.Parameter]] = {}
+    grouped: dict[tuple[bool, float], list[nn.Parameter]] = {}
     seen: set[int] = set()
     for name, parameter in module.named_parameters():
-        if not parameter.requires_grad:
-            continue
         parameter_id = id(parameter)
         if parameter_id in seen:
             raise RuntimeError(f"duplicate optimizer parameter: {name}")
         seen.add(parameter_id)
         is_lower = name.startswith(lower_prefixes)
-        learning_rate = module.config.base_lr
-        if unfrozen and is_lower:
-            learning_rate *= module.config.unfreeze_lr_scale
         no_decay = parameter.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower()
         decay = 0.0 if no_decay else float(weight_decay)
-        grouped.setdefault((learning_rate, decay), []).append(parameter)
+        grouped.setdefault((is_lower, decay), []).append(parameter)
     parameter_groups = [
-        {"params": parameters, "lr": learning_rate, "weight_decay": decay}
-        for (learning_rate, decay), parameters in grouped.items()
+        {
+            "params": parameters,
+            "lr": (
+                0.0
+                if is_lower and frozen
+                else module.config.base_lr
+                * (module.config.unfreeze_lr_scale if is_lower else 1.0)
+            ),
+            "weight_decay": decay,
+            "stage_b_lower": is_lower,
+        }
+        for (is_lower, decay), parameters in grouped.items()
     ]
     if not parameter_groups:
         raise ValueError("module has no trainable parameters")
     return torch.optim.AdamW(parameter_groups, lr=module.config.base_lr)
+
+
+def update_stage_b_optimizer(
+    module: StageBModule,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+) -> torch.optim.Optimizer:
+    """Update Stage B freeze state and group learning rates without rebuilding."""
+
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("optimizer must be a torch optimizer")
+    configure_stage_b_trainability(module, step)
+    expected_ids = {id(parameter) for parameter in module.parameters()}
+    optimizer_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if len(optimizer_ids) != len(set(optimizer_ids)) or set(optimizer_ids) != expected_ids:
+        raise ValueError("optimizer parameters must exactly match the Stage B module")
+    frozen = step < module.config.initial_freeze_steps
+    for group in optimizer.param_groups:
+        is_lower = group.get("stage_b_lower")
+        if not isinstance(is_lower, bool):
+            raise ValueError("optimizer groups must be created by build_stage_b_optimizer")
+        group["lr"] = (
+            0.0
+            if is_lower and frozen
+            else module.config.base_lr
+            * (module.config.unfreeze_lr_scale if is_lower else 1.0)
+        )
+    return optimizer
 
 
 __all__ = [
@@ -506,4 +583,5 @@ __all__ = [
     "build_stage_b_optimizer",
     "configure_stage_b_trainability",
     "sample_patch_mask",
+    "update_stage_b_optimizer",
 ]

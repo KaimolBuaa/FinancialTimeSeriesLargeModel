@@ -1,9 +1,12 @@
 from pathlib import Path
 import math
+import tempfile
 import sys
 import unittest
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
+from torch.nn import functional as F
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +27,10 @@ from factorpanel_fm.training import (
     StageBOutput,
     build_stage_b_optimizer,
     configure_stage_b_trainability,
+    update_stage_b_optimizer,
     sample_patch_mask,
+    _randperm_for_device,
+    _expand_patch_mask_for_overlap,
 )
 
 
@@ -90,6 +96,47 @@ class StageAConfigTests(unittest.TestCase):
         self.assertFalse(first[~valid].any())
         self.assertLessEqual(abs(first.sum().item() / valid.sum().item() - 0.4), 1 / valid.sum().item())
 
+    def test_cpu_generator_random_helper_matches_cpu_reference(self) -> None:
+        expected = torch.randperm(19, generator=torch.Generator().manual_seed(41))
+        actual = _randperm_for_device(
+            19,
+            torch.device("cpu"),
+            generator=torch.Generator().manual_seed(41),
+        )
+        torch.testing.assert_close(actual, expected)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is not available")
+    def test_cpu_generator_can_sample_mps_patch_mask(self) -> None:
+        valid = torch.ones(2, 5, 4, dtype=torch.bool, device="mps")
+
+        sampled = sample_patch_mask(
+            valid,
+            0.4,
+            generator=torch.Generator().manual_seed(17),
+        )
+
+        self.assertEqual(sampled.device.type, "mps")
+        self.assertEqual(sampled.sum().cpu().item(), 16)
+
+    def test_patch_overlap_expansion_uses_exact_interval_geometry(self) -> None:
+        selected = torch.zeros(1, 1, 6, dtype=torch.bool)
+        selected[..., 0] = True
+        torch.testing.assert_close(
+            _expand_patch_mask_for_overlap(selected, patch_size=5, patch_stride=2),
+            torch.tensor([[[True, True, True, False, False, False]]]),
+        )
+
+        selected.zero_()
+        selected[..., 3] = True
+        torch.testing.assert_close(
+            _expand_patch_mask_for_overlap(selected, patch_size=5, patch_stride=2),
+            torch.tensor([[[False, True, True, True, True, True]]]),
+        )
+        torch.testing.assert_close(
+            _expand_patch_mask_for_overlap(selected, patch_size=4, patch_stride=4),
+            selected,
+        )
+
 
 class StageAModuleTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -119,6 +166,7 @@ class StageAModuleTests(unittest.TestCase):
             (2, 5, self.model_config.num_patches, self.model_config.patch_size, 2),
         )
         self.assertEqual(output.patch_mask.shape, patch_mask.shape)
+        self.assertEqual(output.encoder_patch_mask.shape, patch_mask.shape)
         expected_total = (
             output.mask_loss
             + 0.5 * output.future_factor_loss
@@ -146,6 +194,30 @@ class StageAModuleTests(unittest.TestCase):
             reconstruction_mask.unsqueeze(-1).expand_as(output.patch_reconstruction),
         )
         torch.testing.assert_close(output.mask_loss, expected_mask_loss)
+
+    def test_encoder_mask_expands_around_reconstruction_targets(self) -> None:
+        config = ModelConfig.tiny(
+            context_length=13,
+            patch_size=5,
+            patch_stride=2,
+            dropout=0.0,
+        )
+        module = StageAModule(FactorPanelEncoder(config))
+        batch = make_batch(config, batch_size=1, num_assets=2, missing=False)
+        selected = torch.zeros(1, 2, config.num_patches, dtype=torch.bool)
+        selected[:, :, 0] = True
+
+        output = module(
+            batch,
+            torch.randn(1, 2, 2),
+            torch.ones(1, 2, 2, dtype=torch.bool),
+            patch_mask=selected,
+        )
+
+        torch.testing.assert_close(output.patch_mask, selected)
+        expected = torch.zeros_like(selected)
+        expected[:, :, :3] = True
+        torch.testing.assert_close(output.encoder_patch_mask, expected)
 
     def test_sampled_mask_is_deterministic_and_missing_inputs_are_safe(self) -> None:
         targets = torch.full((2, 5, 2), float("nan"))
@@ -186,6 +258,85 @@ class StageAModuleTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(output.consistency_loss))
         self.assertGreaterEqual(output.consistency_loss.item(), 0.0)
+
+    def test_second_view_matches_reordered_assets_by_id(self) -> None:
+        permutation = torch.tensor([3, 0, 4, 1, 2])
+        second_batch = FactorPanelBatch(
+            values=self.batch.values[:, :, permutation],
+            observed_mask=self.batch.observed_mask[:, :, permutation],
+            asset_ids=self.batch.asset_ids[:, permutation],
+            dates=self.batch.dates,
+        )
+
+        output = self.module(
+            self.batch,
+            torch.randn(2, 5, 2),
+            torch.ones(2, 5, 2, dtype=torch.bool),
+            patch_mask=torch.zeros(2, 5, self.model_config.num_patches, dtype=torch.bool),
+            second_batch=second_batch,
+        )
+
+        torch.testing.assert_close(output.consistency_loss, torch.tensor(0.0), atol=1e-6, rtol=0)
+
+    def test_second_view_accepts_asset_subsample_and_first_view_overlap_mask(self) -> None:
+        selected = torch.tensor([4, 1, 3])
+        second_batch = FactorPanelBatch(
+            values=self.batch.values[:, :, selected],
+            observed_mask=self.batch.observed_mask[:, :, selected],
+            asset_ids=self.batch.asset_ids[:, selected],
+            dates=self.batch.dates,
+        )
+        overlap_mask = torch.zeros(2, 5, dtype=torch.bool)
+        overlap_mask[:, selected] = True
+
+        output = self.module(
+            self.batch,
+            torch.randn(2, 5, 2),
+            torch.ones(2, 5, 2, dtype=torch.bool),
+            patch_mask=torch.zeros(2, 5, self.model_config.num_patches, dtype=torch.bool),
+            second_batch=second_batch,
+            overlap_mask=overlap_mask,
+        )
+        second_output = self.module.encoder(second_batch)
+        valid = output.encoder_output.asset_valid[:, selected] & second_output.asset_valid
+        expected = 1.0 - F.cosine_similarity(
+            output.encoder_output.features[:, selected][valid],
+            second_output.features[valid],
+            dim=-1,
+        ).mean()
+        torch.testing.assert_close(output.consistency_loss, expected)
+
+    def test_second_view_rejects_mismatched_dates_and_duplicate_asset_ids(self) -> None:
+        targets = torch.randn(2, 5, 2)
+        target_mask = torch.ones_like(targets, dtype=torch.bool)
+        bad_dates = FactorPanelBatch(
+            values=self.batch.values,
+            observed_mask=self.batch.observed_mask,
+            asset_ids=self.batch.asset_ids,
+            dates=self.batch.dates + 1,
+        )
+        with self.assertRaisesRegex(ValueError, "dates"):
+            self.module(self.batch, targets, target_mask, second_batch=bad_dates)
+
+        duplicate_ids = self.batch.asset_ids.clone()
+        duplicate_ids[:, 1] = duplicate_ids[:, 0]
+        duplicate_second = FactorPanelBatch(
+            values=self.batch.values,
+            observed_mask=self.batch.observed_mask,
+            asset_ids=duplicate_ids,
+            dates=self.batch.dates,
+        )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self.module(self.batch, targets, target_mask, second_batch=duplicate_second)
+
+        duplicate_first = FactorPanelBatch(
+            values=self.batch.values,
+            observed_mask=self.batch.observed_mask,
+            asset_ids=duplicate_ids,
+            dates=self.batch.dates,
+        )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self.module(duplicate_first, targets, target_mask, second_batch=self.batch)
 
 
 class StageBModuleTests(unittest.TestCase):
@@ -245,6 +396,27 @@ class StageBModuleTests(unittest.TestCase):
             expected_ic + 0.5 * expected_pairwise + 0.2 * expected_huber,
         )
 
+    def test_total_loss_backward_preserves_mask_and_reaches_encoder(self) -> None:
+        targets = torch.randn(2, 5, 3)
+        mask = torch.rand(2, 5, 3) > 0.2
+        expected_mask = mask.clone()
+
+        output = self.module(
+            self.batch,
+            targets,
+            mask,
+            generator=torch.Generator().manual_seed(5),
+        )
+        output.total_loss.backward()
+
+        torch.testing.assert_close(mask, expected_mask)
+        missing = [
+            name
+            for name, parameter in self.module.encoder.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
+
     def test_freeze_and_optimizer_groups_have_expected_lr_without_duplicates(self) -> None:
         deep_config = ModelConfig.tiny(dropout=0.0, temporal_layers=8)
         module = StageBModule(
@@ -263,8 +435,18 @@ class StageBModuleTests(unittest.TestCase):
         frozen_optimizer = build_stage_b_optimizer(module, step=0)
         frozen_ids = [id(parameter) for group in frozen_optimizer.param_groups for parameter in group["params"]]
         self.assertEqual(len(frozen_ids), len(set(frozen_ids)))
-        self.assertTrue(lower_parameters.isdisjoint(frozen_ids))
-        self.assertEqual({group["lr"] for group in frozen_optimizer.param_groups}, {3e-4})
+        self.assertEqual(set(frozen_ids), {id(parameter) for parameter in module.parameters()})
+        frozen_grouped = {
+            id(parameter): group["lr"]
+            for group in frozen_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        self.assertTrue(all(frozen_grouped[parameter_id] == 0.0 for parameter_id in lower_parameters))
+        self.assertTrue(all(
+            learning_rate == 3e-4
+            for parameter_id, learning_rate in frozen_grouped.items()
+            if parameter_id not in lower_parameters
+        ))
 
         configure_stage_b_trainability(module, step=5)
         self.assertTrue(all(parameter.requires_grad for parameter in module.parameters()))
@@ -287,6 +469,124 @@ class StageBModuleTests(unittest.TestCase):
         ))
         self.assertIn(0.0, {group["weight_decay"] for group in optimizer.param_groups})
         self.assertIn(0.05, {group["weight_decay"] for group in optimizer.param_groups})
+
+    def test_optimizer_updates_in_place_and_preserves_existing_adam_state(self) -> None:
+        module = StageBModule(
+            FactorPanelEncoder(ModelConfig.tiny(dropout=0.0, temporal_layers=4)),
+            StageBConfig(initial_freeze_steps=2),
+        )
+        batch = make_batch(module.encoder.config, batch_size=1, num_assets=4)
+        optimizer = build_stage_b_optimizer(module, step=0)
+        group_parameters = [tuple(map(id, group["params"])) for group in optimizer.param_groups]
+        output = module(
+            batch,
+            torch.randn(1, 4, 3),
+            torch.ones(1, 4, 3, dtype=torch.bool),
+        )
+        output.total_loss.backward()
+        optimizer.step()
+        upper_parameter = module.return_head.weight
+        expected_momentum = optimizer.state[upper_parameter]["exp_avg"].clone()
+
+        result = update_stage_b_optimizer(module, optimizer, step=2)
+
+        self.assertIs(result, optimizer)
+        self.assertEqual(
+            [tuple(map(id, group["params"])) for group in optimizer.param_groups],
+            group_parameters,
+        )
+        torch.testing.assert_close(optimizer.state[upper_parameter]["exp_avg"], expected_momentum)
+        self.assertTrue(all(parameter.requires_grad for parameter in module.parameters()))
+
+    def test_optimizer_state_dict_restores_across_freeze_boundary(self) -> None:
+        config = ModelConfig.tiny(dropout=0.0, temporal_layers=4)
+        frozen_module = StageBModule(
+            FactorPanelEncoder(config),
+            StageBConfig(initial_freeze_steps=2),
+        )
+        unfrozen_module = StageBModule(
+            FactorPanelEncoder(config),
+            StageBConfig(initial_freeze_steps=2),
+        )
+        frozen_optimizer = build_stage_b_optimizer(frozen_module, step=0)
+        unfrozen_optimizer = build_stage_b_optimizer(unfrozen_module, step=2)
+
+        unfrozen_optimizer.load_state_dict(frozen_optimizer.state_dict())
+        update_stage_b_optimizer(unfrozen_module, unfrozen_optimizer, step=2)
+
+        self.assertEqual(
+            [len(group["params"]) for group in unfrozen_optimizer.param_groups],
+            [len(group["params"]) for group in frozen_optimizer.param_groups],
+        )
+        lower_lrs = {
+            group["lr"]
+            for group in unfrozen_optimizer.param_groups
+            if group["stage_b_lower"]
+        }
+        self.assertTrue(all(math.isclose(learning_rate, 3e-5) for learning_rate in lower_lrs))
+
+
+class DistributedTrainingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._store_directory = tempfile.TemporaryDirectory()
+        store_path = Path(cls._store_directory.name) / "ddp-store"
+        torch.distributed.init_process_group(
+            backend="gloo",
+            init_method=f"file://{store_path}",
+            rank=0,
+            world_size=1,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        torch.distributed.destroy_process_group()
+        cls._store_directory.cleanup()
+
+    def test_stage_a_and_b_support_two_default_ddp_iterations(self) -> None:
+        config = ModelConfig.tiny(dropout=0.0)
+        batch = make_batch(config, batch_size=1, num_assets=4)
+        patch_mask = torch.zeros(1, 4, config.num_patches, dtype=torch.bool)
+        patch_mask[:, :, 1] = True
+
+        stage_a = DistributedDataParallel(StageAModule(FactorPanelEncoder(config)))
+        for _ in range(2):
+            stage_a.zero_grad(set_to_none=True)
+            output_a = stage_a(
+                batch,
+                torch.randn(1, 4, 2),
+                torch.ones(1, 4, 2, dtype=torch.bool),
+                patch_mask=patch_mask,
+            )
+            output_a.total_loss.backward()
+            self.assertEqual(
+                [
+                    name
+                    for name, parameter in stage_a.module.encoder.named_parameters()
+                    if parameter.grad is None
+                ],
+                [],
+            )
+
+        stage_b = DistributedDataParallel(
+            StageBModule(FactorPanelEncoder(config), StageBConfig(initial_freeze_steps=0))
+        )
+        for _ in range(2):
+            stage_b.zero_grad(set_to_none=True)
+            output_b = stage_b(
+                batch,
+                torch.randn(1, 4, 3),
+                torch.ones(1, 4, 3, dtype=torch.bool),
+            )
+            output_b.total_loss.backward()
+            self.assertEqual(
+                [
+                    name
+                    for name, parameter in stage_b.module.encoder.named_parameters()
+                    if parameter.grad is None
+                ],
+                [],
+            )
 
 
 if __name__ == "__main__":

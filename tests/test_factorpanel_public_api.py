@@ -21,6 +21,7 @@ class PublicApiTests(unittest.TestCase):
             "StageBOutput",
             "build_stage_b_optimizer",
             "configure_stage_b_trainability",
+            "update_stage_b_optimizer",
             "load_checkpoint",
             "masked_huber_loss",
             "negative_cross_sectional_ic_loss",

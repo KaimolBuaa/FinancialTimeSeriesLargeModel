@@ -19,6 +19,7 @@ from .training import (
     build_stage_b_optimizer,
     configure_stage_b_trainability,
     sample_patch_mask,
+    update_stage_b_optimizer,
 )
 from .views import InputViews, build_input_views
 
@@ -45,4 +46,5 @@ __all__ = [
     "quantile_pinball_loss",
     "sample_patch_mask",
     "save_checkpoint",
+    "update_stage_b_optimizer",
 ]
