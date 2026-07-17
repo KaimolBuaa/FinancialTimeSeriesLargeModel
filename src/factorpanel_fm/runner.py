@@ -15,8 +15,10 @@ from typing import Callable, Iterable, Iterator
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
+from .batch import FactorPanelBatch
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import FactorPanelSample
 from .training import (
@@ -44,6 +46,7 @@ class RuntimeConfig:
     bf16: bool = True
     checkpoint_every: int = 1000
     device: str = "auto"
+    consistency_keep_ratio: float = 0.75
 
     def __post_init__(self) -> None:
         if self.stage not in ("a", "b"):
@@ -86,6 +89,15 @@ class RuntimeConfig:
             raise ValueError("warmup_ratio must be finite and in [0, 1]")
         if not isinstance(self.bf16, bool):
             raise TypeError("bf16 must be bool")
+        if isinstance(self.consistency_keep_ratio, bool) or not isinstance(
+            self.consistency_keep_ratio, Real
+        ):
+            raise TypeError("consistency_keep_ratio must be a real number")
+        if (
+            not math.isfinite(float(self.consistency_keep_ratio))
+            or not 0 < self.consistency_keep_ratio <= 1
+        ):
+            raise ValueError("consistency_keep_ratio must be finite and in (0, 1]")
         if self.device not in ("auto", "cpu", "mps", "cuda"):
             raise ValueError("device must be auto, cpu, mps, or cuda")
 
@@ -228,10 +240,44 @@ class _CyclingSamples:
         return sample
 
 
-def _validate_stage_module(module: nn.Module, stage: str) -> None:
+def _unwrap_stage_module(module: nn.Module) -> StageAModule | StageBModule:
+    inner = module.module if isinstance(module, DistributedDataParallel) else module
+    if not isinstance(inner, (StageAModule, StageBModule)):
+        raise TypeError("module must contain a StageAModule or StageBModule")
+    return inner
+
+
+def _validate_stage_module(module: StageAModule | StageBModule, stage: str) -> None:
     expected = StageAModule if stage == "a" else StageBModule
     if not isinstance(module, expected):
         raise TypeError(f"stage {stage} requires {expected.__name__}")
+
+
+def _build_consistency_view(
+    batch: FactorPanelBatch,
+    *,
+    keep_ratio: float,
+) -> tuple[FactorPanelBatch, torch.Tensor]:
+    """Randomly retain a subset of valid assets for Stage A consistency."""
+
+    valid_assets = batch.observed_mask.any(dim=1)
+    scores = torch.rand(valid_assets.shape, device=batch.values.device)
+    retained = torch.zeros_like(valid_assets)
+    for batch_index in range(batch.batch_size):
+        valid_indices = valid_assets[batch_index].nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            continue
+        keep_count = max(1, math.ceil(valid_indices.numel() * keep_ratio))
+        selected = scores[batch_index, valid_indices].topk(keep_count).indices
+        retained[batch_index, valid_indices[selected]] = True
+    observed_mask = batch.observed_mask & retained.unsqueeze(1)
+    second_batch = FactorPanelBatch(
+        values=torch.where(observed_mask, batch.values, torch.zeros_like(batch.values)),
+        observed_mask=observed_mask,
+        asset_ids=batch.asset_ids,
+        dates=batch.dates,
+    )
+    return second_batch, valid_assets & retained
 
 
 def _rng_metadata() -> dict[str, object]:
@@ -378,7 +424,8 @@ def run_training(
         raise TypeError("config must be a RuntimeConfig")
     if not isinstance(resume, bool):
         raise TypeError("resume must be bool")
-    _validate_stage_module(module, config.stage)
+    stage_module = _unwrap_stage_module(module)
+    _validate_stage_module(stage_module, config.stage)
     destination = Path(checkpoint_path) if checkpoint_path is not None else None
     if resume and destination is None:
         raise ValueError("resume requires checkpoint_path")
@@ -394,20 +441,29 @@ def run_training(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(config.seed)
         torch.cuda.reset_peak_memory_stats(device)
-    module.to(device)
-    if isinstance(module, StageBModule):
-        if module.config.base_lr != float(config.lr):
+    if isinstance(module, DistributedDataParallel):
+        parameter_device_types = {
+            parameter.device.type for parameter in stage_module.parameters()
+        }
+        if parameter_device_types != {device.type}:
+            raise ValueError(
+                "DDP module parameters must already be on the resolved device"
+            )
+    else:
+        stage_module.to(device)
+    if isinstance(stage_module, StageBModule):
+        if stage_module.config.base_lr != float(config.lr):
             raise ValueError(
                 "RuntimeConfig.lr must equal StageBConfig.base_lr so freeze groups stay coherent"
             )
         optimizer = build_stage_b_optimizer(
-            module,
+            stage_module,
             step=0,
             weight_decay=float(config.weight_decay),
         )
     else:
         optimizer = torch.optim.AdamW(
-            module.parameters(),
+            stage_module.parameters(),
             lr=float(config.lr),
             weight_decay=float(config.weight_decay),
         )
@@ -424,12 +480,12 @@ def run_training(
             raise ValueError(
                 f"checkpoint stage {checkpoint_stage!r} does not match runtime stage {config.stage!r}"
             )
-        if saved_metadata.get("stage_config") != asdict(module.config):
+        if saved_metadata.get("stage_config") != asdict(stage_module.config):
             raise ValueError(
                 "checkpoint stage_config does not match the runtime module config"
             )
         info = load_checkpoint(
-            destination, module, optimizer=optimizer, map_location=device
+            destination, stage_module, optimizer=optimizer, map_location=device
         )
         start_step = info.step
         if start_step >= config.max_steps:
@@ -457,7 +513,7 @@ def run_training(
     final_loss = float("nan")
     started = time.perf_counter()
     while step < config.max_steps:
-        _set_optimizer_step_lrs(module, optimizer, config, step=step)
+        _set_optimizer_step_lrs(stage_module, optimizer, config, step=step)
         accumulated_loss = 0.0
         for _ in range(config.gradient_accumulation):
             sample = samples.next()
@@ -473,14 +529,20 @@ def run_training(
                 enabled=bf16_enabled,
             ):
                 if config.stage == "a":
-                    assert isinstance(module, StageAModule)
+                    assert isinstance(stage_module, StageAModule)
+                    second_batch, overlap_mask = _build_consistency_view(
+                        sample.batch,
+                        keep_ratio=float(config.consistency_keep_ratio),
+                    )
                     output = module(
                         sample.batch,
                         sample.future_factor_targets,
                         sample.future_factor_mask,
+                        second_batch=second_batch,
+                        overlap_mask=overlap_mask,
                     )
                 else:
-                    assert isinstance(module, StageBModule)
+                    assert isinstance(stage_module, StageBModule)
                     output = module(
                         sample.batch,
                         sample.return_targets,
@@ -492,7 +554,9 @@ def run_training(
             (loss / config.gradient_accumulation).backward()
             accumulated_loss += float(loss.detach().cpu())
             micro_steps_total += 1
-        torch.nn.utils.clip_grad_norm_(module.parameters(), float(config.grad_clip))
+        torch.nn.utils.clip_grad_norm_(
+            stage_module.parameters(), float(config.grad_clip)
+        )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
@@ -500,12 +564,12 @@ def run_training(
         if destination is not None and step % config.checkpoint_every == 0:
             save_checkpoint(
                 destination,
-                module,
+                stage_module,
                 optimizer,
                 step,
                 metadata=_checkpoint_metadata(
                     config,
-                    module,
+                    stage_module,
                     consumed_samples=consumed_samples,
                     micro_steps_total=micro_steps_total,
                 ),
@@ -516,12 +580,12 @@ def run_training(
     ):
         save_checkpoint(
             destination,
-            module,
+            stage_module,
             optimizer,
             step,
             metadata=_checkpoint_metadata(
                 config,
-                module,
+                stage_module,
                 consumed_samples=consumed_samples,
                 micro_steps_total=micro_steps_total,
             ),
@@ -539,10 +603,10 @@ def run_training(
         consumed_samples=consumed_samples,
         final_loss=final_loss,
         device=str(device),
-        param_count=sum(parameter.numel() for parameter in module.parameters()),
+        param_count=sum(parameter.numel() for parameter in stage_module.parameters()),
         trainable_param_count=sum(
             parameter.numel()
-            for parameter in module.parameters()
+            for parameter in stage_module.parameters()
             if parameter.requires_grad
         ),
         bf16_enabled=bf16_enabled,

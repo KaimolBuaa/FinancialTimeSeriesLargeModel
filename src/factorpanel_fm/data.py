@@ -158,6 +158,7 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
         stride: int = 1,
         factor_columns: Sequence[str] | None = None,
         return_columns: Sequence[str] = (),
+        return_horizons: Sequence[int] | None = None,
     ) -> None:
         if not isinstance(factors, pd.DataFrame):
             raise TypeError("factors must be a pandas DataFrame")
@@ -208,6 +209,22 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
             raise ValueError(f"factors is missing columns: {sorted(absent_factors)}")
         if selected_returns and labels is None:
             raise ValueError("labels is required when return_columns is nonempty")
+        if selected_returns and return_horizons is None:
+            raise ValueError(
+                "return_horizons is required when return_columns is nonempty"
+            )
+        selected_return_horizons = tuple(return_horizons or ())
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral) or value <= 0
+            for value in selected_return_horizons
+        ):
+            raise ValueError("return_horizons must contain positive integers")
+        if len(selected_return_horizons) != len(set(selected_return_horizons)):
+            raise ValueError("return_horizons must not contain duplicates")
+        if len(selected_return_horizons) != len(selected_returns):
+            raise ValueError(
+                "return_horizons and return_columns must have the same length"
+            )
         absent_returns = set(selected_returns).difference(
             labels.columns if labels is not None else ()
         )
@@ -246,6 +263,11 @@ class PanelFrameDataset(Dataset[FactorPanelSample]):
         self.factor_columns = selected_factors
         self.return_columns = selected_returns
         self.future_horizons = tuple(int(value) for value in horizons)
+        self.return_horizons = tuple(int(value) for value in selected_return_horizons)
+        self.max_target_horizon = max(
+            (*self.future_horizons, *self.return_horizons),
+            default=0,
+        )
         self.context_length = int(context_length)
         self.stride = int(stride)
         self._integer_dates = pd.api.types.is_integer_dtype(date_values.dtype)
@@ -394,6 +416,10 @@ def chronological_split_indices(
         raise TypeError("purge must be an integer")
     if purge < 0:
         raise ValueError("purge must be nonnegative")
+    if purge < dataset.max_target_horizon:
+        raise ValueError(
+            f"purge must be at least max_target_horizon={dataset.max_target_horizon}"
+        )
     train_code = _boundary_code(train_end, dataset)
     valid_code = _boundary_code(valid_end, dataset)
     if train_code >= valid_code:

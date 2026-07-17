@@ -139,6 +139,7 @@ class PanelFrameDatasetTests(unittest.TestCase):
             stride=2,
             factor_columns=("value", "quality"),
             return_columns=("r1", "r5"),
+            return_horizons=(1, 5),
         )
 
         self.assertEqual(len(dataset), 4)
@@ -209,6 +210,7 @@ class PanelFrameDatasetTests(unittest.TestCase):
                 future_horizons=(1, 2),
                 factor_columns=("value",),
                 return_columns=("r1", "r5"),
+                return_horizons=(1, 5),
             )
 
         self.assertEqual(dataset[0].decision_date, 3)
@@ -264,7 +266,7 @@ class PanelFrameDatasetTests(unittest.TestCase):
         dataset = PanelFrameDataset(
             factors,
             context_length=1,
-            future_horizons=(1,),
+            future_horizons=(),
         )
 
         train, valid, test = chronological_split_indices(
@@ -281,8 +283,77 @@ class PanelFrameDatasetTests(unittest.TestCase):
             [dataset[index].decision_date for index in valid], [20210101, 20221231]
         )
         self.assertEqual(
-            [dataset[index].decision_date for index in test], [20230101, 20250101]
+            [dataset[index].decision_date for index in test],
+            [20230101, 20250101, 20260101],
         )
+
+    def test_return_horizons_are_explicit_and_purge_covers_all_targets(self) -> None:
+        factors, labels = self.frames()
+        with self.assertRaisesRegex(ValueError, "return_horizons"):
+            PanelFrameDataset(
+                factors,
+                labels,
+                context_length=2,
+                future_horizons=(2,),
+                factor_columns=("value",),
+                return_columns=("r1", "r5"),
+            )
+        with self.assertRaisesRegex(ValueError, "same length"):
+            PanelFrameDataset(
+                factors,
+                labels,
+                context_length=2,
+                future_horizons=(2,),
+                factor_columns=("value",),
+                return_columns=("r1", "r5"),
+                return_horizons=(5,),
+            )
+
+        extended_factors = pd.DataFrame(
+            {
+                "date": list(range(1, 26)),
+                "asset": ["A"] * 25,
+                "value": [float(value) for value in range(1, 26)],
+            }
+        )
+        extended_labels = pd.DataFrame(
+            {
+                "date": list(range(1, 26)),
+                "asset": ["A"] * 25,
+                "r1": [float(value) for value in range(1, 26)],
+                "r5": [float(value) for value in range(1, 26)],
+            }
+        )
+        dataset = PanelFrameDataset(
+            extended_factors,
+            extended_labels,
+            context_length=1,
+            future_horizons=(2,),
+            factor_columns=("value",),
+            return_columns=("r1", "r5"),
+            return_horizons=(1, 5),
+        )
+        self.assertEqual(dataset.max_target_horizon, 5)
+        with self.assertRaisesRegex(ValueError, "max_target_horizon"):
+            chronological_split_indices(dataset, train_end=10, valid_end=20, purge=4)
+
+        train, valid, test = chronological_split_indices(
+            dataset,
+            train_end=10,
+            valid_end=20,
+            purge=5,
+        )
+        self.assertEqual(
+            [dataset[index].decision_date for index in train], list(range(1, 6))
+        )
+        self.assertEqual(
+            [dataset[index].decision_date for index in valid], list(range(11, 16))
+        )
+        self.assertEqual(
+            [dataset[index].decision_date for index in test], list(range(21, 24))
+        )
+        self.assertTrue(set(train).isdisjoint(valid))
+        self.assertTrue(set(valid).isdisjoint(test))
 
 
 if __name__ == "__main__":

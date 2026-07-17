@@ -125,9 +125,11 @@ def _run_pilot(arguments: argparse.Namespace) -> RunSummary:
         raise ValueError("--resume requires --checkpoint")
     if arguments.stage == "b" and (labels_path is None or not arguments.return_columns):
         raise ValueError("Stage B requires --labels and --return-columns")
-    if arguments.stage == "b" and arguments.return_horizons is None:
-        raise ValueError("Stage B requires --return-horizons")
-    if arguments.stage == "b" and len(arguments.return_horizons) != len(
+    if arguments.return_columns and arguments.return_horizons is None:
+        raise ValueError("--return-columns requires --return-horizons")
+    if arguments.return_horizons and not arguments.return_columns:
+        raise ValueError("--return-horizons requires --return-columns")
+    if arguments.return_horizons is not None and len(arguments.return_horizons) != len(
         arguments.return_columns
     ):
         raise ValueError(
@@ -143,6 +145,7 @@ def _run_pilot(arguments: argparse.Namespace) -> RunSummary:
         future_horizons=(5, 20) if arguments.stage == "a" else (),
         factor_columns=arguments.factor_columns,
         return_columns=arguments.return_columns or (),
+        return_horizons=arguments.return_horizons,
     )
     if len(dataset) == 0:
         raise ValueError("pilot dataset has no complete context/future windows")

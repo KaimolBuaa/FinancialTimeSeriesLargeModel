@@ -66,6 +66,12 @@ class FactorPanelCliTests(unittest.TestCase):
                             payload["metadata"]["stage_config"]["horizons"],
                             (1, 5, 20),
                         )
+                        self.assertFalse(
+                            any(
+                                key.startswith("module.")
+                                for key in payload["model_state"]
+                            )
+                        )
                         self.assertTrue(
                             all(
                                 group["lr"] == 0.0

@@ -5,6 +5,8 @@ import tempfile
 import unittest
 
 import torch
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 
@@ -17,6 +19,7 @@ from factorpanel_fm import (  # noqa: E402
     FactorPanelSample,
     ModelConfig,
     RuntimeConfig,
+    StageAConfig,
     StageAModule,
     StageBConfig,
     StageBModule,
@@ -27,7 +30,10 @@ from factorpanel_fm import (  # noqa: E402
     run_training,
     warmup_cosine_multiplier,
 )
-from factorpanel_fm.runner import _set_optimizer_step_lrs  # noqa: E402
+from factorpanel_fm.runner import (  # noqa: E402
+    _build_consistency_view,
+    _set_optimizer_step_lrs,
+)
 
 
 def make_sample(seed: int = 7, decision_date: int | None = None) -> FactorPanelSample:
@@ -60,6 +66,73 @@ class InterruptAfter:
         raise RuntimeError("simulated interruption")
 
 
+class SpyStageAModule(StageAModule):
+    def __init__(self, encoder: FactorPanelEncoder, config: StageAConfig) -> None:
+        super().__init__(encoder, config)
+        self.second_batch = None
+        self.overlap_mask = None
+        self.consistency_loss = None
+
+    def forward(self, *args, **kwargs):
+        self.second_batch = kwargs.get("second_batch")
+        self.overlap_mask = kwargs.get("overlap_mask")
+        output = super().forward(*args, **kwargs)
+        self.consistency_loss = output.consistency_loss.detach()
+        return output
+
+
+def _runner_ddp_worker(rank: int, world_size: int, store_path: str, stage: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{store_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(301)
+        config = ModelConfig.tiny(dropout=0.0)
+        inner = (
+            StageAModule(FactorPanelEncoder(config))
+            if stage == "a"
+            else StageBModule(
+                FactorPanelEncoder(config),
+                StageBConfig(initial_freeze_steps=1),
+            )
+        )
+        distributed = DistributedDataParallel(inner)
+        sample = make_sample(401 + rank, 16 + rank)
+        summary = run_training(
+            distributed,
+            [sample],
+            RuntimeConfig(
+                stage=stage,
+                max_steps=2,
+                gradient_accumulation=1,
+                consistency_keep_ratio=0.75,
+                device="cpu",
+                bf16=False,
+                seed=409,
+            ),
+            checkpoint_path=f"{store_path}.{stage}.pt" if rank == 0 else None,
+        )
+        if summary.step != 2:
+            raise AssertionError("DDP runner did not complete two optimizer steps")
+        flattened = torch.cat(
+            [parameter.detach().flatten() for parameter in inner.parameters()]
+        )
+        gathered = [torch.empty_like(flattened) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, flattened)
+        if not all(torch.equal(gathered[0], other) for other in gathered[1:]):
+            raise AssertionError("DDP runner parameters differ across ranks")
+        torch.distributed.barrier()
+        if rank == 0:
+            payload = torch.load(f"{store_path}.{stage}.pt", weights_only=True)
+            if any(key.startswith("module.") for key in payload["model_state"]):
+                raise AssertionError("DDP checkpoint leaked the wrapper module prefix")
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class RuntimeConfigTests(unittest.TestCase):
     def test_defaults_and_validation(self) -> None:
         config = RuntimeConfig(stage="a")
@@ -67,6 +140,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.micro_batch_size, 1)
         self.assertEqual(config.gradient_accumulation, 4)
         self.assertTrue(config.bf16)
+        self.assertEqual(config.consistency_keep_ratio, 0.75)
         for overrides in (
             {"stage": "c"},
             {"model": "large"},
@@ -76,6 +150,8 @@ class RuntimeConfigTests(unittest.TestCase):
             {"lr": 0.0},
             {"warmup_ratio": 1.1},
             {"grad_clip": float("inf")},
+            {"consistency_keep_ratio": 0.0},
+            {"consistency_keep_ratio": 1.1},
         ):
             with self.subTest(overrides=overrides):
                 with self.assertRaises((TypeError, ValueError)):
@@ -111,6 +187,91 @@ class RuntimeConfigTests(unittest.TestCase):
 
 
 class RunTrainingTests(unittest.TestCase):
+    def test_stage_a_builds_asset_subsample_consistency_view(self) -> None:
+        sample = make_sample(13)
+        module = SpyStageAModule(
+            FactorPanelEncoder(ModelConfig.tiny(dropout=0.0)),
+            StageAConfig(mask_weight=0.0, future_weight=0.0, consistency_weight=1.0),
+        )
+        initial = [parameter.detach().clone() for parameter in module.parameters()]
+
+        run_training(
+            module,
+            [sample],
+            RuntimeConfig(
+                stage="a",
+                max_steps=1,
+                gradient_accumulation=1,
+                consistency_keep_ratio=0.5,
+                device="cpu",
+                bf16=False,
+            ),
+        )
+
+        self.assertIsNotNone(module.second_batch)
+        self.assertIsNotNone(module.overlap_mask)
+        self.assertTrue(module.overlap_mask.any())
+        self.assertFalse(module.overlap_mask.all())
+        self.assertGreater(module.consistency_loss.item(), 0.0)
+        self.assertTrue(
+            any(
+                not torch.equal(parameter, before)
+                for parameter, before in zip(module.parameters(), initial)
+            )
+        )
+
+    def test_consistency_view_is_safe_for_empty_and_single_asset_batches(self) -> None:
+        empty = make_sample(17)
+        empty_batch = FactorPanelBatch(
+            values=torch.zeros_like(empty.batch.values),
+            observed_mask=torch.zeros_like(empty.batch.observed_mask),
+            asset_ids=empty.batch.asset_ids,
+            dates=empty.batch.dates,
+        )
+        second, overlap = _build_consistency_view(empty_batch, keep_ratio=0.75)
+        self.assertFalse(second.observed_mask.any())
+        self.assertFalse(overlap.any())
+
+        values = torch.ones(1, 16, 1)
+        single = FactorPanelBatch(
+            values=values,
+            observed_mask=torch.ones_like(values, dtype=torch.bool),
+            asset_ids=torch.tensor([[1]]),
+            dates=torch.arange(16).unsqueeze(0),
+        )
+        second, overlap = _build_consistency_view(single, keep_ratio=0.1)
+        self.assertTrue(second.observed_mask.all())
+        self.assertTrue(overlap.all())
+
+        module = StageAModule(FactorPanelEncoder(ModelConfig.tiny(dropout=0.0)))
+        for batch in (empty_batch, single):
+            with self.subTest(num_assets=batch.num_assets):
+                second, overlap = _build_consistency_view(batch, keep_ratio=0.75)
+                targets = torch.zeros(batch.batch_size, batch.num_assets, 2)
+                target_mask = torch.zeros_like(targets, dtype=torch.bool)
+                output = module(
+                    batch,
+                    targets,
+                    target_mask,
+                    second_batch=second,
+                    overlap_mask=overlap,
+                )
+                self.assertTrue(torch.isfinite(output.total_loss))
+                output.total_loss.backward()
+                module.zero_grad(set_to_none=True)
+
+    @unittest.skipUnless(torch.distributed.is_available(), "distributed is unavailable")
+    def test_run_training_supports_two_rank_ddp_for_both_stages(self) -> None:
+        for stage in ("a", "b"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                store_path = str(Path(directory) / f"{stage}.store")
+                mp.spawn(
+                    _runner_ddp_worker,
+                    args=(2, store_path, stage),
+                    nprocs=2,
+                    join=True,
+                )
+
     def test_two_optimizer_steps_run_for_stage_a_and_b(self) -> None:
         sample = make_sample()
         for stage, module in (
