@@ -177,6 +177,30 @@ class CheckpointTests(unittest.TestCase):
             self.assert_nested_equal(target.state_dict(), expected_model)
             self.assert_nested_equal(target_optimizer.state_dict(), expected_optimizer)
 
+    def test_incompatible_optimizer_tensor_shape_does_not_mutate_objects(self) -> None:
+        source = nn.Linear(3, 2)
+        source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+        source(torch.randn(4, 3)).square().mean().backward()
+        source_optimizer.step()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad-state-shape.pt"
+            save_checkpoint(path, source, source_optimizer, step=3)
+            payload = torch.load(path, weights_only=True)
+            first_parameter_id = payload["optimizer_state"]["param_groups"][0]["params"][0]
+            payload["optimizer_state"]["state"][first_parameter_id]["exp_avg"] = torch.zeros(1)
+            torch.save(payload, path)
+
+            target = nn.Linear(3, 2)
+            target_optimizer = torch.optim.AdamW(target.parameters(), lr=0.7)
+            expected_model = copy.deepcopy(target.state_dict())
+            expected_optimizer = copy.deepcopy(target_optimizer.state_dict())
+
+            with self.assertRaisesRegex(ValueError, "optimizer state.*shape"):
+                load_checkpoint(path, target, target_optimizer)
+
+            self.assert_nested_equal(target.state_dict(), expected_model)
+            self.assert_nested_equal(target_optimizer.state_dict(), expected_optimizer)
+
 
 if __name__ == "__main__":
     unittest.main()

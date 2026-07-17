@@ -55,6 +55,80 @@ def make_batch(
     )
 
 
+def _stage_b_freeze_ddp_worker(rank: int, world_size: int, store_path: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{store_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(101 + rank)
+        config = ModelConfig.tiny(dropout=0.0, temporal_layers=4)
+        module = StageBModule(
+            FactorPanelEncoder(config),
+            StageBConfig(
+                initial_freeze_steps=2,
+                base_lr=1e-2,
+                ic_weight=0.0,
+                pairwise_weight=0.0,
+                huber_weight=1.0,
+            ),
+        )
+        optimizer = build_stage_b_optimizer(module, step=0)
+        if not all(parameter.requires_grad for parameter in module.parameters()):
+            raise AssertionError("Stage B parameters must stay in the DDP graph while frozen")
+        distributed = DistributedDataParallel(module)
+        batch = make_batch(config, batch_size=1, num_assets=4, missing=False)
+        lower = [
+            parameter
+            for block in module.encoder.temporal_blocks[:2]
+            for parameter in block.parameters()
+        ]
+        initial = [parameter.detach().clone() for parameter in lower]
+
+        for step in range(2):
+            update_stage_b_optimizer(module, optimizer, step)
+            optimizer.zero_grad(set_to_none=True)
+            torch.manual_seed(1000 * rank + step)
+            output = distributed(
+                batch,
+                torch.randn(1, 4, 3),
+                torch.ones(1, 4, 3, dtype=torch.bool),
+            )
+            output.total_loss.backward()
+            if any(parameter.grad is None for parameter in lower):
+                raise AssertionError("frozen lower parameters must receive synchronized gradients")
+            flattened = torch.cat([parameter.grad.flatten() for parameter in lower])
+            gathered = [torch.empty_like(flattened) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, flattened)
+            if not all(torch.allclose(gathered[0], other) for other in gathered[1:]):
+                raise AssertionError("lower gradients differ across DDP ranks")
+            optimizer.step()
+            if any(not torch.equal(parameter, expected) for parameter, expected in zip(lower, initial)):
+                raise AssertionError("zero-lr lower parameters changed during the freeze period")
+
+        update_stage_b_optimizer(module, optimizer, step=2)
+        optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(2000 + rank)
+        output = distributed(
+            batch,
+            torch.randn(1, 4, 3),
+            torch.ones(1, 4, 3, dtype=torch.bool),
+        )
+        output.total_loss.backward()
+        flattened = torch.cat([parameter.grad.flatten() for parameter in lower])
+        gathered = [torch.empty_like(flattened) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, flattened)
+        if not all(torch.allclose(gathered[0], other) for other in gathered[1:]):
+            raise AssertionError("unfrozen lower gradients differ across DDP ranks")
+        optimizer.step()
+        if not any(not torch.equal(parameter, expected) for parameter, expected in zip(lower, initial)):
+            raise AssertionError("lower parameters did not update after the freeze boundary")
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class StageAConfigTests(unittest.TestCase):
     def test_defaults_and_validation(self) -> None:
         config = StageAConfig()
@@ -338,6 +412,37 @@ class StageAModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unique"):
             self.module(duplicate_first, targets, target_mask, second_batch=self.batch)
 
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is not available")
+    def test_second_view_supports_mps_features_with_cpu_coordinates(self) -> None:
+        module = StageAModule(FactorPanelEncoder(self.model_config)).to("mps")
+        values = torch.randn(1, self.model_config.context_length, 4, device="mps")
+        asset_ids = torch.tensor([[10, 20, 30, 40]])
+        dates = torch.arange(self.model_config.context_length).unsqueeze(0)
+        batch = FactorPanelBatch(
+            values=values,
+            observed_mask=torch.ones_like(values, dtype=torch.bool),
+            asset_ids=asset_ids,
+            dates=dates,
+        )
+        permutation = torch.tensor([2, 0, 3], device="mps")
+        second_batch = FactorPanelBatch(
+            values=values.index_select(2, permutation),
+            observed_mask=torch.ones(1, self.model_config.context_length, 3, dtype=torch.bool, device="mps"),
+            asset_ids=asset_ids[:, [2, 0, 3]],
+            dates=dates,
+        )
+
+        output = module(
+            batch,
+            torch.randn(1, 4, 2, device="mps"),
+            torch.ones(1, 4, 2, dtype=torch.bool, device="mps"),
+            patch_mask=torch.zeros(1, 4, self.model_config.num_patches, dtype=torch.bool, device="mps"),
+            second_batch=second_batch,
+        )
+
+        self.assertEqual(output.consistency_loss.device.type, "mps")
+        self.assertTrue(torch.isfinite(output.consistency_loss).cpu().item())
+
 
 class StageBModuleTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -431,7 +536,7 @@ class StageBModuleTests(unittest.TestCase):
 
         configure_stage_b_trainability(module, step=0)
         self.assertTrue(lower_parameters)
-        self.assertTrue(all(not parameter.requires_grad for parameter in module.parameters() if id(parameter) in lower_parameters))
+        self.assertTrue(all(parameter.requires_grad for parameter in module.parameters()))
         frozen_optimizer = build_stage_b_optimizer(module, step=0)
         frozen_ids = [id(parameter) for group in frozen_optimizer.param_groups for parameter in group["params"]]
         self.assertEqual(len(frozen_ids), len(set(frozen_ids)))
@@ -586,6 +691,18 @@ class DistributedTrainingTests(unittest.TestCase):
                     if parameter.grad is None
                 ],
                 [],
+            )
+
+
+class MultiProcessDistributedTrainingTests(unittest.TestCase):
+    def test_stage_b_freeze_boundary_keeps_lower_gradients_in_two_rank_ddp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = str(Path(directory) / "stage-b-ddp-store")
+            torch.multiprocessing.spawn(
+                _stage_b_freeze_ddp_worker,
+                args=(2, store_path),
+                nprocs=2,
+                join=True,
             )
 
 

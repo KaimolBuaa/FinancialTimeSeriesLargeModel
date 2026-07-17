@@ -317,13 +317,19 @@ class StageAModule(nn.Module):
                     raise ValueError(f"{name} asset_ids must be unique within each batch")
             second_output = self.encoder(second_batch)
             matches = batch.asset_ids.unsqueeze(-1) == second_batch.asset_ids.unsqueeze(-2)
-            has_match = matches.any(dim=-1)
+            feature_device = second_output.features.device
+            has_match = matches.any(dim=-1).to(feature_device)
             second_indices = matches.to(torch.int64).argmax(dim=-1)
+            feature_indices = second_indices.to(feature_device)
             matched_features = second_output.features.gather(
                 1,
-                second_indices.unsqueeze(-1).expand(-1, -1, second_output.features.shape[-1]),
+                feature_indices.unsqueeze(-1).expand(
+                    -1,
+                    -1,
+                    second_output.features.shape[-1],
+                ),
             )
-            matched_valid = second_output.asset_valid.gather(1, second_indices)
+            matched_valid = second_output.asset_valid.gather(1, feature_indices)
             overlap = encoder_output.asset_valid & has_match & matched_valid
             if overlap_mask is not None:
                 if not isinstance(overlap_mask, torch.Tensor):
@@ -483,7 +489,7 @@ def _lower_temporal_prefixes(module: StageBModule) -> tuple[str, ...]:
 
 
 def configure_stage_b_trainability(module: StageBModule, step: int) -> None:
-    """Freeze the lower temporal half during the initial Stage B period."""
+    """Keep every Stage B parameter in the graph across the freeze boundary."""
 
     if not isinstance(module, StageBModule):
         raise TypeError("module must be a StageBModule")
@@ -491,10 +497,8 @@ def configure_stage_b_trainability(module: StageBModule, step: int) -> None:
         raise TypeError("step must be an integer")
     if step < 0:
         raise ValueError("step must be nonnegative")
-    frozen = step < module.config.initial_freeze_steps
-    lower_prefixes = _lower_temporal_prefixes(module)
-    for name, parameter in module.named_parameters():
-        parameter.requires_grad_(not (frozen and name.startswith(lower_prefixes)))
+    for parameter in module.parameters():
+        parameter.requires_grad_(True)
 
 
 def build_stage_b_optimizer(

@@ -85,8 +85,11 @@ def _preflight_optimizer_state(
         raise ValueError("checkpoint optimizer param groups must be lists")
     if len(checkpoint_groups) != len(current_groups):
         raise ValueError("checkpoint optimizer param groups have incompatible counts")
-    for index, (checkpoint_group, current_group) in enumerate(
-        zip(checkpoint_groups, current_groups)
+    checkpoint_state = optimizer_state.get("state")
+    if not isinstance(checkpoint_state, Mapping):
+        raise ValueError("checkpoint optimizer state must be a mapping")
+    for index, (checkpoint_group, current_group, live_group) in enumerate(
+        zip(checkpoint_groups, current_groups, optimizer.param_groups)
     ):
         if not isinstance(checkpoint_group, Mapping):
             raise ValueError(f"checkpoint optimizer param group {index} must be a mapping")
@@ -98,6 +101,26 @@ def _preflight_optimizer_state(
             raise ValueError(
                 f"checkpoint optimizer param groups have incompatible params at group {index}"
             )
+        live_parameters = live_group.get("params")
+        if not isinstance(live_parameters, list) or len(live_parameters) != len(
+            checkpoint_params
+        ):
+            raise ValueError("current optimizer param groups are internally inconsistent")
+        for checkpoint_id, parameter in zip(checkpoint_params, live_parameters):
+            parameter_state = checkpoint_state.get(checkpoint_id, {})
+            if not isinstance(parameter_state, Mapping):
+                raise ValueError("checkpoint optimizer parameter state must be a mapping")
+            for state_name, state_value in parameter_state.items():
+                if (
+                    isinstance(state_value, torch.Tensor)
+                    and state_value.ndim > 0
+                    and state_value.shape != parameter.shape
+                ):
+                    raise ValueError(
+                        "checkpoint optimizer state tensor shape mismatch for "
+                        f"{state_name!r}: {tuple(state_value.shape)} != "
+                        f"{tuple(parameter.shape)}"
+                    )
 
 
 def save_checkpoint(
