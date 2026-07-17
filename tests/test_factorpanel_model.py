@@ -61,6 +61,10 @@ class ModelConfigTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     ModelConfig.tiny(**overrides)
 
+    def test_rejects_patch_geometry_that_drops_trailing_timesteps(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cover"):
+            ModelConfig(context_length=257)
+
 
 class FactorPanelEncoderTests(unittest.TestCase):
     def setUp(self) -> None:

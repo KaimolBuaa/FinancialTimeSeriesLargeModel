@@ -54,6 +54,8 @@ class ModelConfig:
                 raise ValueError(f"{name} must be positive")
         if self.context_length < self.patch_size:
             raise ValueError("context_length must be at least patch_size")
+        if (self.context_length - self.patch_size) % self.patch_stride != 0:
+            raise ValueError("patches must exactly cover context_length")
         if self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         if (self.d_model // self.num_heads) % 2 != 0:
