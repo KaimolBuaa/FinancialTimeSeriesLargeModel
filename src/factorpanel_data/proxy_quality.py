@@ -355,6 +355,76 @@ def _load_and_validate_state(config: ProxyFactorConfig) -> dict:
     return state
 
 
+def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
+    if year not in config.years:
+        raise ValueError(f"year {year} is outside the configured range")
+    state_path = config.output_root / "_state.json"
+    if not state_path.is_file():
+        raise ValueError("missing generation state")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("fingerprint") != config.fingerprint:
+        raise ValueError("state fingerprint does not match configuration")
+    year_state = state.get("years", {}).get(str(year))
+    if year_state is None:
+        raise ValueError(f"missing year {year} in generation state")
+    factor_path = config.output_root / year_state["factor_path"]
+    label_path = config.output_root / year_state["label_path"]
+    factor_names = [item.name for item in PROXY_FACTOR_REGISTRY]
+    label_names = [item.name for item in PROXY_LABEL_REGISTRY]
+    expected_factor_schema = ["date", "asset", *factor_names]
+    expected_label_schema = [
+        "date",
+        "asset",
+        *label_names,
+        *(f"{name}_mask" for name in label_names),
+    ]
+    for path, checksum_key, expected_schema in (
+        (factor_path, "factor_sha256", expected_factor_schema),
+        (label_path, "label_sha256", expected_label_schema),
+    ):
+        if not path.is_file():
+            raise ValueError(f"missing partition: {path}")
+        if sha256_file(path) != year_state[checksum_key]:
+            raise ValueError(f"checksum mismatch: {path}")
+        if pq.ParquetFile(path).schema_arrow.names != expected_schema:
+            raise ValueError(f"schema mismatch: {path}")
+    factor_keys = pd.read_parquet(factor_path, columns=["date", "asset"])
+    label_keys = pd.read_parquet(label_path, columns=["date", "asset"])
+    duplicate_keys = int(
+        factor_keys.duplicated(["date", "asset"]).sum()
+        + label_keys.duplicated(["date", "asset"]).sum()
+    )
+    if duplicate_keys:
+        raise ValueError(f"duplicate date/asset keys in year {year}")
+    for keys, kind in ((factor_keys, "factor"), (label_keys, "label")):
+        dates = pd.to_datetime(keys["date"])
+        if not dates.empty and not dates.dt.year.eq(year).all():
+            raise ValueError(f"{kind} partition contains dates outside year {year}")
+        if not pd.MultiIndex.from_frame(keys[["date", "asset"]]).is_monotonic_increasing:
+            raise ValueError(f"{kind} partition keys are not sorted")
+    nonfinite_values = 0
+    factor_parquet = pq.ParquetFile(factor_path)
+    for batch in factor_parquet.iter_batches(
+        batch_size=65_536,
+        columns=factor_names,
+    ):
+        for column in batch.columns:
+            values = column.to_pandas().to_numpy(dtype="float32", copy=False)
+            nonfinite_values += int(np.isinf(values).sum())
+    if nonfinite_values:
+        raise ValueError(f"year {year} contains {nonfinite_values} nonfinite values")
+    return {
+        "year": year,
+        "factor_rows": len(factor_keys),
+        "label_rows": len(label_keys),
+        "factor_columns": len(factor_names),
+        "duplicate_keys": duplicate_keys,
+        "nonfinite_values": nonfinite_values,
+        "checksums_valid": True,
+        "schemas_valid": True,
+    }
+
+
 def _validate_partition_files(config: ProxyFactorConfig, state: dict) -> int:
     factor_names = [item.name for item in PROXY_FACTOR_REGISTRY]
     label_names = [item.name for item in PROXY_LABEL_REGISTRY]
