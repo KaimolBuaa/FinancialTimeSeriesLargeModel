@@ -13,8 +13,12 @@ dependencies = [
   "pyarrow>=22.0.0",
 ]
 
+[project.optional-dependencies]
+proxy = ["pyqlib>=0.9.7"]
+
 [project.scripts]
 factorpanel-fm = "factorpanel_fm.cli:main"
+factorpanel-proxy = "factorpanel_data.proxy_cli:main"
 
 [tool.setuptools]
 packages = ["factorpanel_fm", "factorpanel_data"]
