@@ -171,6 +171,34 @@ class ProxyQualityTests(unittest.TestCase):
             self.assertEqual(result["factors_checked"], 14)
             self.assertEqual(result["dates_checked"], 3)
 
+    def test_pandas_rsquared_two_uses_three_observation_minimum(self):
+        from factorpanel_data.proxy_quality import compute_proxy_factors_pandas
+
+        close = pd.Series([10.0, 11.0, 13.0, 12.0, 16.0, 15.0])
+        raw = pd.DataFrame(
+            {
+                "open": close * 0.99,
+                "high": close * 1.02,
+                "low": close * 0.98,
+                "close": close,
+                "vwap": close * 1.001,
+                "volume": [100.0, 120.0, 90.0, 140.0, 110.0, 160.0],
+                "amount": close * 1.001 * 100.0,
+            }
+        )
+        time = pd.Series(np.arange(len(close), dtype="float64"))
+        expected = close.rolling(3, min_periods=3).corr(time).pow(2)
+
+        actual = compute_proxy_factors_pandas(raw)["pf_rsqr_2"]
+
+        np.testing.assert_allclose(
+            actual.to_numpy(),
+            expected.to_numpy(),
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

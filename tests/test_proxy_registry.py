@@ -48,6 +48,13 @@ class ProxyFactorRegistryTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             factor.name = "changed"
 
+    def test_two_day_rsquared_uses_three_observation_minimum(self):
+        from factorpanel_data.proxy_registry import build_proxy_factor_registry
+
+        factors = {item.name: item for item in build_proxy_factor_registry()}
+
+        self.assertEqual(factors["pf_rsqr_2"].expression, "Rsquare($close,3)")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -164,7 +164,11 @@ def compute_proxy_factors_pandas(raw: pd.DataFrame) -> pd.DataFrame:
         result[f"pf_beta_{window}"] = _rolling_slope(close, window) / (
             close + epsilon
         )
-        result[f"pf_rsqr_{window}"] = rolling_close.corr(time).pow(2)
+        rsquared_window = max(window, 3)
+        result[f"pf_rsqr_{window}"] = close.rolling(
+            rsquared_window,
+            min_periods=rsquared_window,
+        ).corr(time).pow(2)
         result[f"pf_max_{window}"] = close / (rolling_high + epsilon) - 1
         result[f"pf_min_{window}"] = close / (rolling_low + epsilon) - 1
         result[f"pf_rsv_{window}"] = (close - rolling_low) / (

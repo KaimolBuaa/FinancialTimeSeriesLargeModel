@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 from typing import Sequence
+import uuid
 
 import numpy as np
 
@@ -67,20 +70,63 @@ def _preflight_generation(
     config: ProxyFactorConfig,
     *,
     force_years: set[int],
-) -> None:
+) -> bool:
     state_path = config.output_root / "_state.json"
     if not state_path.is_file():
-        return
+        return False
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if state.get("fingerprint") == config.fingerprint:
-        return
+        return False
     existing_years = {int(year) for year in state.get("years", {})}
     if not existing_years or existing_years.issubset(force_years):
-        return
+        return True
     raise ValueError(
         "generation fingerprint does not match existing state; "
         "force every existing year to replace it"
     )
+
+
+def prepare_for_forced_migration(
+    config: ProxyFactorConfig,
+    force_years: set[int],
+) -> Path | None:
+    state_path = config.output_root / "_state.json"
+    if not state_path.is_file():
+        return None
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("fingerprint") == config.fingerprint:
+        return None
+    existing_years = {int(year) for year in state.get("years", {})}
+    if not existing_years.issubset(force_years):
+        raise ValueError(
+            "generation fingerprint does not match existing state; "
+            "force every existing year to replace it"
+        )
+    backup = config.output_root / (
+        f"_state.{state.get('fingerprint', 'unknown')}.{uuid.uuid4().hex}.json"
+    )
+    shutil.copy2(state_path, backup)
+    temporary = state_path.with_name(
+        f".{state_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "fingerprint": config.fingerprint,
+                    "years": {},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return backup
 
 
 def _emit(payload: dict, *, stream=sys.stdout) -> None:
@@ -96,12 +142,17 @@ def _generate(args: argparse.Namespace, config: ProxyFactorConfig) -> dict:
     if not set(years).issubset(config.years):
         raise ValueError("requested generation years are outside the configuration")
     force_years = set(args.force_year or [])
-    _preflight_generation(config, force_years=force_years)
+    migration_required = _preflight_generation(
+        config,
+        force_years=force_years,
+    )
     provider = QlibProxyProvider(
         config.provider_uri,
         universe=config.universe,
         kernels=args.kernels,
     )
+    if migration_required:
+        prepare_for_forced_migration(config, force_years)
     generated = []
     skipped = []
     for year in years:

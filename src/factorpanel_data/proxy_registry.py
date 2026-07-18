@@ -111,7 +111,9 @@ def build_proxy_factor_registry() -> tuple[FactorDefinition, ...]:
     rolling = tuple(
         FactorDefinition(
             name=f"pf_{family}_{window}",
-            expression=template.format(w=window),
+            expression=template.format(
+                w=max(window, 3) if family == "rsqr" else window
+            ),
             family=family,
             window=window,
         )
@@ -139,4 +141,3 @@ def build_label_registry() -> tuple[LabelDefinition, ...]:
 
 PROXY_FACTOR_REGISTRY = build_proxy_factor_registry()
 PROXY_LABEL_REGISTRY = build_label_registry()
-

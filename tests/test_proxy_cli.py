@@ -153,6 +153,36 @@ class ProxyCliTests(unittest.TestCase):
 
         self.assertIn('factorpanel-proxy = "factorpanel_data.proxy_cli:main"', pyproject)
 
+    def test_full_force_set_resets_mismatched_state_with_backup(self):
+        from factorpanel_data.proxy_cli import prepare_for_forced_migration
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_config(root, end_year=2009)
+            config = load_proxy_config(config_path, project_root=root)
+            config.output_root.mkdir()
+            state_path = config.output_root / "_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "fingerprint": "old-fingerprint",
+                        "years": {"2008": {}, "2009": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            backup = prepare_for_forced_migration(config, {2008, 2009})
+
+            self.assertIsNotNone(backup)
+            self.assertTrue(backup.is_file())
+            old_state = json.loads(backup.read_text(encoding="utf-8"))
+            new_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(old_state["fingerprint"], "old-fingerprint")
+            self.assertEqual(new_state["fingerprint"], config.fingerprint)
+            self.assertEqual(new_state["years"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

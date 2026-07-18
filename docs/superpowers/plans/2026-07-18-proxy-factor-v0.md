@@ -128,7 +128,12 @@ def build_proxy_factor_registry() -> tuple[FactorDefinition, ...]:
         "vstd": "Std($volume,{w})/(Mean($volume,{w})+1e-12)",
     }
     rolling = tuple(
-        FactorDefinition(f"pf_{family}_{window}", template.format(w=window), family, window)
+        FactorDefinition(
+            f"pf_{family}_{window}",
+            template.format(w=max(window, 3) if family == "rsqr" else window),
+            family,
+            window,
+        )
         for family, template in templates.items()
         for window in FACTOR_WINDOWS
     )
@@ -148,6 +153,8 @@ def build_label_registry() -> tuple[LabelDefinition, ...]:
         for horizon in (1, 5, 20)
     )
 ```
+
+`pf_rsqr_2` 必须使用 `Rsquare($close,3)`：两点回归的 R² 恒为 1，会触发 99% 近常数质量门槛。名称和名义窗口仍保持为 2，manifest 以实际表达式为准。
 
 - [ ] **Step 4: Run registry tests and full regression tests**
 
