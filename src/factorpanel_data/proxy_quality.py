@@ -12,6 +12,7 @@ import uuid
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
@@ -23,6 +24,35 @@ from .proxy_registry import (
     PROXY_LABEL_REGISTRY,
 )
 from .qlib_proxy import ProxyProvider, query_factor_range
+
+
+FORMULA_AUDIT_FACTORS = (
+    "pf_kmid",
+    "pf_klen",
+    "pf_kmid2",
+    "pf_open_close",
+    "pf_high_close",
+    "pf_low_close",
+    "pf_vwap_close",
+    "pf_return_1",
+    "pf_volume_change_1",
+    "pf_amount_change_1",
+    "pf_roc_20",
+    "pf_ma_20",
+    "pf_std_20",
+    "pf_beta_20",
+    "pf_rsqr_20",
+    "pf_max_20",
+    "pf_min_20",
+    "pf_rsv_20",
+    "pf_corr_20",
+    "pf_cord_20",
+    "pf_cntd_20",
+    "pf_sumd_20",
+    "pf_vma_20",
+    "pf_vstd_20",
+)
+RAW_AUDIT_FIELDS = ("open", "high", "low", "close", "vwap", "volume", "amount")
 
 
 @dataclass(frozen=True)
@@ -160,15 +190,17 @@ def compute_proxy_factors_pandas(raw: pd.DataFrame) -> pd.DataFrame:
         rolling_low = low.rolling(window, min_periods=window).min()
         result[f"pf_roc_{window}"] = close / (close.shift(window) + epsilon) - 1
         result[f"pf_ma_{window}"] = close / (rolling_close.mean() + epsilon) - 1
-        result[f"pf_std_{window}"] = rolling_close.std(ddof=0) / (close + epsilon)
-        result[f"pf_beta_{window}"] = _rolling_slope(close, window) / (
-            close + epsilon
-        )
+        result[f"pf_std_{window}"] = rolling_close.std() / (close + epsilon)
+        result[f"pf_beta_{window}"] = _rolling_slope(close, window) / (close + epsilon)
         rsquared_window = max(window, 3)
-        result[f"pf_rsqr_{window}"] = close.rolling(
-            rsquared_window,
-            min_periods=rsquared_window,
-        ).corr(time).pow(2)
+        result[f"pf_rsqr_{window}"] = (
+            close.rolling(
+                rsquared_window,
+                min_periods=rsquared_window,
+            )
+            .corr(time)
+            .pow(2)
+        )
         result[f"pf_max_{window}"] = close / (rolling_high + epsilon) - 1
         result[f"pf_min_{window}"] = close / (rolling_low + epsilon) - 1
         result[f"pf_rsv_{window}"] = (close - rolling_low) / (
@@ -186,10 +218,8 @@ def compute_proxy_factors_pandas(raw: pd.DataFrame) -> pd.DataFrame:
             positive_delta.rolling(window, min_periods=window).sum()
             - negative_delta.rolling(window, min_periods=window).sum()
         ) / (delta.abs().rolling(window, min_periods=window).sum() + epsilon)
-        result[f"pf_vma_{window}"] = volume / (
-            rolling_volume.mean() + epsilon
-        ) - 1
-        result[f"pf_vstd_{window}"] = rolling_volume.std(ddof=0) / (
+        result[f"pf_vma_{window}"] = volume / (rolling_volume.mean() + epsilon) - 1
+        result[f"pf_vstd_{window}"] = rolling_volume.std() / (
             rolling_volume.mean() + epsilon
         )
     ordered_names = [item.name for item in PROXY_FACTOR_REGISTRY]
@@ -254,6 +284,179 @@ def verify_pandas_causality(
     return {"passed": True, "factors_checked": original.shape[1]}
 
 
+def _default_audit_years(config: ProxyFactorConfig) -> tuple[int, ...]:
+    years = config.years
+    if len(years) < 3:
+        return years
+    return years[0], years[len(years) // 2], years[-1]
+
+
+def verify_qlib_formula_audit(
+    config: ProxyFactorConfig,
+    provider: ProxyProvider,
+    *,
+    years: Sequence[int] | None = None,
+    max_assets: int = 3,
+    rtol: float = 2e-4,
+    atol: float = 2e-5,
+) -> dict:
+    """Compare registered Qlib expressions with an independent pandas calculation."""
+    selected_years = tuple(years) if years is not None else _default_audit_years(config)
+    required_year_count = min(3, len(config.years))
+    if len(set(selected_years)) < required_year_count:
+        raise ValueError(
+            f"formula audit requires at least {required_year_count} distinct years"
+        )
+    if not set(selected_years).issubset(config.years):
+        raise ValueError("formula audit years are outside the configured range")
+    if max_assets <= 0:
+        raise ValueError("max_assets must be positive")
+    definitions = {definition.name: definition for definition in PROXY_FACTOR_REGISTRY}
+    selected = tuple(definitions[name] for name in FORMULA_AUDIT_FACTORS)
+    audit_warmup = max(definition.window or 0 for definition in selected)
+    registry_causal = not any(
+        ",-" in definition.expression.replace(" ", "")
+        for definition in PROXY_FACTOR_REGISTRY
+    )
+    if not registry_causal:
+        return {
+            "passed": False,
+            "years_checked": list(selected_years),
+            "factors_checked": list(FORMULA_AUDIT_FACTORS),
+            "comparisons": 0,
+            "max_abs_error": None,
+            "registry_causal": False,
+            "error": "factor registry contains a future Ref expression",
+        }
+    comparisons = 0
+    maximum_error = 0.0
+    for year in selected_years:
+        start_time = f"{year:04d}-01-01"
+        end_time = f"{year:04d}-02-15"
+        raw = provider.query(
+            [f"${name}" for name in RAW_AUDIT_FIELDS],
+            list(RAW_AUDIT_FIELDS),
+            start_time,
+            end_time,
+        )
+        actual = provider.query(
+            [definition.expression for definition in selected],
+            list(FORMULA_AUDIT_FACTORS),
+            start_time,
+            end_time,
+        )
+        for frame, expected_columns in (
+            (raw, list(RAW_AUDIT_FIELDS)),
+            (actual, list(FORMULA_AUDIT_FACTORS)),
+        ):
+            if not isinstance(frame.index, pd.MultiIndex):
+                raise ValueError("formula audit provider result must use a MultiIndex")
+            if frame.index.names != ["instrument", "datetime"]:
+                raise ValueError(
+                    "formula audit provider index must be instrument/datetime"
+                )
+            if frame.index.has_duplicates or frame.columns.tolist() != expected_columns:
+                raise ValueError("formula audit provider returned an invalid schema")
+        assets = sorted(
+            set(raw.index.get_level_values("instrument"))
+            & set(actual.index.get_level_values("instrument"))
+        )[:max_assets]
+        if not assets:
+            raise ValueError(f"formula audit found no shared assets in {year}")
+        for asset in assets:
+            asset_raw = raw.xs(asset, level="instrument").sort_index()
+            expected = compute_proxy_factors_pandas(asset_raw).loc[
+                :, FORMULA_AUDIT_FACTORS
+            ]
+            observed = (
+                actual.xs(asset, level="instrument")
+                .sort_index()
+                .loc[:, FORMULA_AUDIT_FACTORS]
+            )
+            common_dates = expected.index.intersection(observed.index)
+            # Qlib loads pre-start history for Ref and rolling expressions, while
+            # the raw audit query cannot. Compare after the largest audit window.
+            common_dates = common_dates[audit_warmup:]
+            if common_dates.empty:
+                raise ValueError(f"formula audit has insufficient dates in {year}")
+            for name in FORMULA_AUDIT_FACTORS:
+                expected_values = expected.loc[common_dates, name].to_numpy(
+                    dtype="float64", copy=False
+                )
+                observed_values = observed.loc[common_dates, name].to_numpy(
+                    dtype="float64", copy=False
+                )
+                expected_finite = np.isfinite(expected_values)
+                observed_finite = np.isfinite(observed_values)
+                if not np.array_equal(expected_finite, observed_finite):
+                    return {
+                        "passed": False,
+                        "years_checked": list(selected_years),
+                        "factors_checked": list(FORMULA_AUDIT_FACTORS),
+                        "comparisons": comparisons,
+                        "max_abs_error": maximum_error,
+                        "registry_causal": True,
+                        "error": (
+                            f"{name} finite mask differs from pandas in {year} "
+                            f"for {asset}"
+                        ),
+                    }
+                finite = expected_finite
+                if not finite.any():
+                    return {
+                        "passed": False,
+                        "years_checked": list(selected_years),
+                        "factors_checked": list(FORMULA_AUDIT_FACTORS),
+                        "comparisons": comparisons,
+                        "max_abs_error": maximum_error,
+                        "registry_causal": True,
+                        "error": f"{name} has no finite comparisons in {year}",
+                    }
+                differences = np.abs(expected_values[finite] - observed_values[finite])
+                maximum_error = max(maximum_error, float(differences.max()))
+                comparisons += int(finite.sum())
+                if not np.allclose(
+                    expected_values[finite],
+                    observed_values[finite],
+                    rtol=rtol,
+                    atol=atol,
+                ):
+                    return {
+                        "passed": False,
+                        "years_checked": list(selected_years),
+                        "factors_checked": list(FORMULA_AUDIT_FACTORS),
+                        "comparisons": comparisons,
+                        "max_abs_error": maximum_error,
+                        "registry_causal": True,
+                        "error": (
+                            f"{name} differs from pandas in {year} for {asset}; "
+                            f"max_abs_error={float(differences.max()):.8g}"
+                        ),
+                    }
+    return {
+        "passed": True,
+        "years_checked": list(selected_years),
+        "factors_checked": list(FORMULA_AUDIT_FACTORS),
+        "comparisons": comparisons,
+        "max_abs_error": maximum_error,
+        "registry_causal": True,
+    }
+
+
+def verify_causality_audit(
+    config: ProxyFactorConfig,
+    provider: ProxyProvider,
+) -> dict:
+    pandas_result = verify_pandas_causality()
+    formula_result = verify_qlib_formula_audit(config, provider)
+    return {
+        "passed": bool(pandas_result["passed"] and formula_result["passed"]),
+        "fingerprint": config.fingerprint,
+        "pandas_perturbation": pandas_result,
+        "qlib_vs_pandas": formula_result,
+    }
+
+
 def verify_year_boundary(
     config: ProxyFactorConfig,
     provider: ProxyProvider,
@@ -263,9 +466,7 @@ def verify_year_boundary(
 ) -> dict:
     if year not in config.years:
         raise ValueError(f"year {year} is outside the configured range")
-    long_window = tuple(
-        item for item in PROXY_FACTOR_REGISTRY if item.window == 120
-    )
+    long_window = tuple(item for item in PROXY_FACTOR_REGISTRY if item.window == 120)
     names = [item.name for item in long_window]
     factor_path = config.output_root / f"factors/year={year:04d}/part.parquet"
     if not factor_path.is_file():
@@ -274,9 +475,7 @@ def verify_year_boundary(
         factor_path,
         columns=["date", "asset", *names],
     )
-    dates = pd.DatetimeIndex(stored["date"].drop_duplicates().sort_values())[
-        :max_dates
-    ]
+    dates = pd.DatetimeIndex(stored["date"].drop_duplicates().sort_values())[:max_dates]
     if dates.empty:
         raise ValueError(f"factor partition has no dates: {factor_path}")
     stored = stored.loc[stored["date"].isin(dates)].sort_values(
@@ -328,9 +527,7 @@ def verify_year_boundary(
 
 def _atomic_json_write(payload: dict, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -359,15 +556,86 @@ def _load_and_validate_state(config: ProxyFactorConfig) -> dict:
     return state
 
 
-def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
-    if year not in config.years:
-        raise ValueError(f"year {year} is outside the configured range")
-    state_path = config.output_root / "_state.json"
-    if not state_path.is_file():
-        raise ValueError("missing generation state")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    if state.get("fingerprint") != config.fingerprint:
-        raise ValueError("state fingerprint does not match configuration")
+def _load_listing_intervals(config: ProxyFactorConfig) -> pd.DataFrame:
+    path = config.provider_uri / "instruments" / "all.txt"
+    if not path.is_file():
+        raise ValueError(f"listing interval file is missing: {path}")
+    intervals = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        names=["asset", "listing_start", "listing_end"],
+        dtype={"asset": str},
+        parse_dates=["listing_start", "listing_end"],
+    )
+    intervals["asset"] = intervals["asset"].str.upper()
+    if intervals["asset"].duplicated().any():
+        raise ValueError("listing interval file contains duplicate assets")
+    return intervals
+
+
+def _validate_listing_intervals(
+    keys: pd.DataFrame,
+    intervals: pd.DataFrame,
+    year: int,
+) -> None:
+    merged = keys.assign(asset=keys["asset"].astype(str).str.upper()).merge(
+        intervals,
+        on="asset",
+        how="left",
+        validate="many_to_one",
+    )
+    if merged["listing_start"].isna().any():
+        missing = sorted(merged.loc[merged["listing_start"].isna(), "asset"].unique())
+        raise ValueError(f"assets are missing from listing intervals: {missing[:5]}")
+    dates = pd.to_datetime(merged["date"])
+    valid = dates.between(merged["listing_start"], merged["listing_end"])
+    if not valid.all():
+        row = merged.loc[~valid, ["asset", "date"]].iloc[0]
+        raise ValueError(
+            f"year {year} row is outside listing interval: "
+            f"{row['asset']} {pd.Timestamp(row['date']).date()}"
+        )
+
+
+def _factor_statistics_from_parquet(
+    parquet: pq.ParquetFile,
+    factor_names: Sequence[str],
+) -> dict[str, FactorQualityStats]:
+    result: dict[str, FactorQualityStats] = {}
+    for name in factor_names:
+        column = parquet.read(columns=[name]).column(name)
+        values = column.to_pandas().to_numpy(dtype="float32", copy=False)
+        result[name] = _factor_stats(values)
+    return result
+
+
+def _validate_physical_schema(
+    schema: pa.Schema,
+    *,
+    value_names: Sequence[str],
+    mask_names: Sequence[str] = (),
+) -> None:
+    if not pa.types.is_timestamp(schema.field("date").type):
+        raise ValueError("schema mismatch: date must be a timestamp")
+    if not pa.types.is_string(schema.field("asset").type):
+        raise ValueError("schema mismatch: asset must be a string")
+    for name in value_names:
+        if not pa.types.is_float32(schema.field(name).type):
+            raise ValueError(f"schema mismatch: {name} must be float32")
+    for name in mask_names:
+        if not pa.types.is_boolean(schema.field(name).type):
+            raise ValueError(f"schema mismatch: {name} must be boolean")
+
+
+def _validate_year_partition(
+    config: ProxyFactorConfig,
+    state: dict,
+    intervals: pd.DataFrame,
+    year: int,
+    *,
+    include_statistics: bool,
+) -> tuple[dict, dict[str, FactorQualityStats], dict]:
     year_state = state.get("years", {}).get(str(year))
     if year_state is None:
         raise ValueError(f"missing year {year} in generation state")
@@ -382,18 +650,45 @@ def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
         *label_names,
         *(f"{name}_mask" for name in label_names),
     ]
-    for path, checksum_key, expected_schema in (
-        (factor_path, "factor_sha256", expected_factor_schema),
-        (label_path, "label_sha256", expected_label_schema),
+    parquet_files: dict[Path, pq.ParquetFile] = {}
+    for path, checksum_key, expected_schema, row_key, values, masks in (
+        (
+            factor_path,
+            "factor_sha256",
+            expected_factor_schema,
+            "factor_rows",
+            factor_names,
+            (),
+        ),
+        (
+            label_path,
+            "label_sha256",
+            expected_label_schema,
+            "label_rows",
+            label_names,
+            [f"{name}_mask" for name in label_names],
+        ),
     ):
         if not path.is_file():
             raise ValueError(f"missing partition: {path}")
         if sha256_file(path) != year_state[checksum_key]:
             raise ValueError(f"checksum mismatch: {path}")
-        if pq.ParquetFile(path).schema_arrow.names != expected_schema:
+        parquet = pq.ParquetFile(path)
+        parquet_files[path] = parquet
+        if parquet.schema_arrow.names != expected_schema:
             raise ValueError(f"schema mismatch: {path}")
+        _validate_physical_schema(
+            parquet.schema_arrow,
+            value_names=values,
+            mask_names=masks,
+        )
+        if parquet.metadata.num_rows != int(year_state[row_key]):
+            raise ValueError(f"state row count mismatch: {path}")
+    if int(year_state.get("factor_columns", -1)) != len(factor_names):
+        raise ValueError(f"state factor column count mismatch in year {year}")
     factor_keys = pd.read_parquet(factor_path, columns=["date", "asset"])
-    label_keys = pd.read_parquet(label_path, columns=["date", "asset"])
+    label_frame = pd.read_parquet(label_path)
+    label_keys = label_frame[["date", "asset"]]
     duplicate_keys = int(
         factor_keys.duplicated(["date", "asset"]).sum()
         + label_keys.duplicated(["date", "asset"]).sum()
@@ -404,10 +699,23 @@ def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
         dates = pd.to_datetime(keys["date"])
         if not dates.empty and not dates.dt.year.eq(year).all():
             raise ValueError(f"{kind} partition contains dates outside year {year}")
-        if not pd.MultiIndex.from_frame(keys[["date", "asset"]]).is_monotonic_increasing:
+        if not pd.MultiIndex.from_frame(
+            keys[["date", "asset"]]
+        ).is_monotonic_increasing:
             raise ValueError(f"{kind} partition keys are not sorted")
+    if not factor_keys.reset_index(drop=True).equals(label_keys.reset_index(drop=True)):
+        raise ValueError(f"factor/label keys do not match in year {year}")
+    _validate_listing_intervals(factor_keys, intervals, year)
+    for name in label_names:
+        values = label_frame[name].to_numpy(dtype="float32", copy=False)
+        if np.isinf(values).any():
+            raise ValueError(f"label {name} contains nonfinite values in year {year}")
+        expected_mask = np.isfinite(values)
+        actual_mask = label_frame[f"{name}_mask"].to_numpy(dtype=np.bool_, copy=False)
+        if not np.array_equal(expected_mask, actual_mask):
+            raise ValueError(f"label mask mismatch for {name} in year {year}")
     nonfinite_values = 0
-    factor_parquet = pq.ParquetFile(factor_path)
+    factor_parquet = parquet_files[factor_path]
     for batch in factor_parquet.iter_batches(
         batch_size=65_536,
         columns=factor_names,
@@ -417,7 +725,12 @@ def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
             nonfinite_values += int(np.isinf(values).sum())
     if nonfinite_values:
         raise ValueError(f"year {year} contains {nonfinite_values} nonfinite values")
-    return {
+    statistics = (
+        _factor_statistics_from_parquet(factor_parquet, factor_names)
+        if include_statistics
+        else {}
+    )
+    report = {
         "year": year,
         "factor_rows": len(factor_keys),
         "label_rows": len(label_keys),
@@ -426,49 +739,64 @@ def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
         "nonfinite_values": nonfinite_values,
         "checksums_valid": True,
         "schemas_valid": True,
+        "keys_aligned": True,
+        "masks_valid": True,
+        "listing_intervals_valid": True,
     }
+    partition_record = {
+        **year_state,
+        "factor_bytes": factor_path.stat().st_size,
+        "label_bytes": label_path.stat().st_size,
+    }
+    return report, statistics, partition_record
 
 
-def _validate_partition_files(config: ProxyFactorConfig, state: dict) -> int:
-    factor_names = [item.name for item in PROXY_FACTOR_REGISTRY]
-    label_names = [item.name for item in PROXY_LABEL_REGISTRY]
-    factor_schema = ["date", "asset", *factor_names]
-    label_schema = [
-        "date",
-        "asset",
-        *label_names,
-        *(f"{name}_mask" for name in label_names),
-    ]
+def verify_materialized_year(config: ProxyFactorConfig, year: int) -> dict:
+    if year not in config.years:
+        raise ValueError(f"year {year} is outside the configured range")
+    state_path = config.output_root / "_state.json"
+    if not state_path.is_file():
+        raise ValueError("missing generation state")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("fingerprint") != config.fingerprint:
+        raise ValueError("state fingerprint does not match configuration")
+    report, _, _ = _validate_year_partition(
+        config,
+        state,
+        _load_listing_intervals(config),
+        year,
+        include_statistics=False,
+    )
+    return report
+
+
+def _validate_partition_files(
+    config: ProxyFactorConfig,
+    state: dict,
+) -> tuple[int, dict[str, dict], dict[str, dict]]:
+    intervals = _load_listing_intervals(config)
     total_rows = 0
+    yearly_statistics: dict[str, dict] = {}
+    partition_records: dict[str, dict] = {}
     for year in config.years:
-        year_state = state["years"][str(year)]
-        factor_path = config.output_root / year_state["factor_path"]
-        label_path = config.output_root / year_state["label_path"]
-        for path, checksum_key, expected_schema in (
-            (factor_path, "factor_sha256", factor_schema),
-            (label_path, "label_sha256", label_schema),
-        ):
-            if not path.is_file():
-                raise ValueError(f"missing partition: {path}")
-            if sha256_file(path) != year_state[checksum_key]:
-                raise ValueError(f"checksum mismatch: {path}")
-            parquet = pq.ParquetFile(path)
-            if parquet.schema_arrow.names != expected_schema:
-                raise ValueError(f"schema mismatch: {path}")
-        keys = pd.read_parquet(factor_path, columns=["date", "asset"])
-        if keys.duplicated(["date", "asset"]).any():
-            raise ValueError(f"duplicate date/asset keys: {factor_path}")
-        key_index = pd.MultiIndex.from_frame(keys[["date", "asset"]])
-        if not key_index.is_monotonic_increasing:
-            raise ValueError(f"partition keys are not sorted: {factor_path}")
-        label_keys = pd.read_parquet(label_path, columns=["date", "asset"])
-        if label_keys.duplicated(["date", "asset"]).any():
-            raise ValueError(f"duplicate date/asset keys: {label_path}")
-        total_rows += len(keys)
-    return total_rows
+        report, statistics, record = _validate_year_partition(
+            config,
+            state,
+            intervals,
+            year,
+            include_statistics=True,
+        )
+        total_rows += report["factor_rows"]
+        yearly_statistics[str(year)] = {
+            name: asdict(item) for name, item in statistics.items()
+        }
+        partition_records[str(year)] = record
+    return total_rows, yearly_statistics, partition_records
 
 
-def _global_factor_statistics(config: ProxyFactorConfig) -> dict[str, FactorQualityStats]:
+def _global_factor_statistics(
+    config: ProxyFactorConfig,
+) -> dict[str, FactorQualityStats]:
     dataset = ds.dataset(
         config.output_root / "factors",
         format="parquet",
@@ -482,10 +810,36 @@ def _global_factor_statistics(config: ProxyFactorConfig) -> dict[str, FactorQual
     return result
 
 
+def _validate_causality_audit(
+    config: ProxyFactorConfig,
+    audit: dict | None,
+) -> dict:
+    if not audit or not audit.get("passed"):
+        raise ValueError("a passing causality audit is required before finalization")
+    if audit.get("fingerprint") != config.fingerprint:
+        raise ValueError("causality audit fingerprint does not match configuration")
+    pandas_result = audit.get("pandas_perturbation", {})
+    formula_result = audit.get("qlib_vs_pandas", {})
+    if not pandas_result.get("passed") or pandas_result.get("factors_checked") != 128:
+        raise ValueError("causality audit pandas perturbation evidence is incomplete")
+    years = tuple(formula_result.get("years_checked", []))
+    factors = tuple(formula_result.get("factors_checked", []))
+    if (
+        not formula_result.get("passed")
+        or not formula_result.get("registry_causal")
+        or years != _default_audit_years(config)
+        or factors != FORMULA_AUDIT_FACTORS
+        or int(formula_result.get("comparisons", 0)) <= 0
+    ):
+        raise ValueError("causality audit Qlib/pandas evidence is incomplete")
+    return audit
+
+
 def finalize_dataset(
     config: ProxyFactorConfig,
     *,
     completed_years: Iterable[int] | None = None,
+    causality_audit: dict | None = None,
 ) -> dict:
     manifest_path = config.output_root / "manifest.json"
     manifest_path.unlink(missing_ok=True)
@@ -499,8 +853,12 @@ def finalize_dataset(
         if extra:
             raise ValueError(f"unexpected years: {extra}")
     state = _load_and_validate_state(config)
-    total_rows = _validate_partition_files(config, state)
+    total_rows, yearly_statistics, partition_records = _validate_partition_files(
+        config,
+        state,
+    )
     stats = _global_factor_statistics(config)
+    validated_audit = _validate_causality_audit(config, causality_audit)
     nonfinite_values = sum(item.nonfinite_count for item in stats.values())
     failures: list[str] = []
     if nonfinite_values:
@@ -525,7 +883,9 @@ def finalize_dataset(
         "total_rows": total_rows,
         "duplicate_keys": 0,
         "nonfinite_values": nonfinite_values,
+        "yearly_factors": yearly_statistics,
         "factors": {name: asdict(item) for name, item in stats.items()},
+        "causality_audit": validated_audit,
     }
     quality_path = config.output_root / "quality_report.json"
     _atomic_json_write(quality_report, quality_path)
@@ -545,7 +905,7 @@ def finalize_dataset(
         "years": list(config.years),
         "factors": [asdict(item) for item in PROXY_FACTOR_REGISTRY],
         "labels": [asdict(item) for item in PROXY_LABEL_REGISTRY],
-        "partitions": state["years"],
+        "partitions": partition_records,
         "quality_report": quality_path.name,
         "quality_report_sha256": sha256_file(quality_path),
     }

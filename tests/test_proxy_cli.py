@@ -36,6 +36,12 @@ class CliProvider:
 def write_config(root: Path, end_year: int = 2025) -> Path:
     provider = root / "qlib"
     provider.mkdir()
+    instruments = provider / "instruments"
+    instruments.mkdir()
+    (instruments / "all.txt").write_text(
+        "SH600000\t2008-01-01\t2025-12-31\nSZ000001\t2008-01-01\t2025-12-31\n",
+        encoding="utf-8",
+    )
     output = root / "proxy"
     config_path = root / "configs" / "proxy.json"
     config_path.parent.mkdir()
@@ -151,7 +157,9 @@ class ProxyCliTests(unittest.TestCase):
     def test_pyproject_registers_proxy_console_script(self):
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-        self.assertIn('factorpanel-proxy = "factorpanel_data.proxy_cli:main"', pyproject)
+        self.assertIn(
+            'factorpanel-proxy = "factorpanel_data.proxy_cli:main"', pyproject
+        )
 
     def test_full_force_set_resets_mismatched_state_with_backup(self):
         from factorpanel_data.proxy_cli import prepare_for_forced_migration

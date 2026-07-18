@@ -55,9 +55,7 @@ def normalize_proxy_frame(
     result = ordered.reset_index()
     result["date"] = pd.to_datetime(result["date"])
     result["asset"] = result["asset"].astype(str)
-    result = result.sort_values(["date", "asset"], kind="stable").reset_index(
-        drop=True
-    )
+    result = result.sort_values(["date", "asset"], kind="stable").reset_index(drop=True)
     result = result.loc[:, ["date", "asset", *columns]]
     if result.duplicated(["date", "asset"]).any():
         raise ValueError("proxy partition contains duplicate date/asset keys")
@@ -88,9 +86,7 @@ def atomic_parquet_write(
     writer: ParquetWriter = _default_parquet_writer,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         writer(frame, temporary, compression)
         os.replace(temporary, destination)
@@ -120,9 +116,7 @@ def _load_state(config: ProxyFactorConfig) -> dict:
 def _write_state(config: ProxyFactorConfig, state: dict) -> None:
     destination = config.output_root / "_state.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(
             json.dumps(state, indent=2, sort_keys=True) + "\n",
@@ -145,14 +139,33 @@ def _validate_parquet(
         raise ValueError(f"unexpected Parquet row count: {path}")
 
 
-def _publish_pair(
+def _restore_state_snapshot(
+    state_path: Path,
+    previous_state: bytes | None,
+) -> None:
+    if previous_state is None:
+        state_path.unlink(missing_ok=True)
+        return
+    temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.rollback")
+    try:
+        temporary.write_bytes(previous_state)
+        os.replace(temporary, state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_pair_and_state(
     factor_temporary: Path,
     factor_path: Path,
     label_temporary: Path,
     label_path: Path,
+    config: ProxyFactorConfig,
+    state: dict,
 ) -> None:
     backups: dict[Path, Path] = {}
     published: list[Path] = []
+    state_path = config.output_root / "_state.json"
+    previous_state = state_path.read_bytes() if state_path.exists() else None
     try:
         for destination in (factor_path, label_path):
             if destination.exists():
@@ -167,16 +180,17 @@ def _publish_pair(
         ):
             os.replace(temporary, destination)
             published.append(destination)
+        _write_state(config, state)
     except Exception:
         for destination in published:
             destination.unlink(missing_ok=True)
         for destination, backup in backups.items():
             if backup.exists():
                 os.replace(backup, destination)
+        _restore_state_snapshot(state_path, previous_state)
         raise
-    finally:
-        for backup in backups.values():
-            backup.unlink(missing_ok=True)
+    for backup in backups.values():
+        backup.unlink(missing_ok=True)
 
 
 def _resume_result(
@@ -258,9 +272,7 @@ def materialize_year(
     factor_temporary = factor_path.with_name(
         f".{factor_path.name}.{uuid.uuid4().hex}.tmp"
     )
-    label_temporary = label_path.with_name(
-        f".{label_path.name}.{uuid.uuid4().hex}.tmp"
-    )
+    label_temporary = label_path.with_name(f".{label_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         writer(factor_frame, factor_temporary, config.compression)
         writer(label_frame, label_temporary, config.compression)
@@ -280,31 +292,32 @@ def materialize_year(
             ],
             len(label_frame),
         )
-        _publish_pair(
+        factor_sha256 = sha256_file(factor_temporary)
+        label_sha256 = sha256_file(label_temporary)
+        year_state = {
+            "factor_path": str(factor_path.relative_to(config.output_root)),
+            "label_path": str(label_path.relative_to(config.output_root)),
+            "factor_rows": len(factor_frame),
+            "label_rows": len(label_frame),
+            "factor_columns": len(factor_names),
+            "factor_sha256": factor_sha256,
+            "label_sha256": label_sha256,
+        }
+        state["version"] = 1
+        state["fingerprint"] = config.fingerprint
+        state.setdefault("years", {})[str(year)] = year_state
+        _publish_pair_and_state(
             factor_temporary,
             factor_path,
             label_temporary,
             label_path,
+            config,
+            state,
         )
     finally:
         factor_temporary.unlink(missing_ok=True)
         label_temporary.unlink(missing_ok=True)
 
-    factor_sha256 = sha256_file(factor_path)
-    label_sha256 = sha256_file(label_path)
-    year_state = {
-        "factor_path": str(factor_path.relative_to(config.output_root)),
-        "label_path": str(label_path.relative_to(config.output_root)),
-        "factor_rows": len(factor_frame),
-        "label_rows": len(label_frame),
-        "factor_columns": len(factor_names),
-        "factor_sha256": factor_sha256,
-        "label_sha256": label_sha256,
-    }
-    state["version"] = 1
-    state["fingerprint"] = config.fingerprint
-    state.setdefault("years", {})[str(year)] = year_state
-    _write_state(config, state)
     return MaterializeResult(
         year=year,
         factor_path=factor_path,

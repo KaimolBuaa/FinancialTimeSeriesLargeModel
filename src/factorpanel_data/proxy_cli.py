@@ -17,8 +17,8 @@ from .proxy_config import ProxyFactorConfig, load_proxy_config
 from .proxy_materialize import materialize_year
 from .proxy_quality import (
     finalize_dataset,
+    verify_causality_audit,
     verify_materialized_year,
-    verify_pandas_causality,
     verify_year_boundary,
 )
 from .proxy_store import ProxyFactorStore
@@ -106,9 +106,7 @@ def prepare_for_forced_migration(
         f"_state.{state.get('fingerprint', 'unknown')}.{uuid.uuid4().hex}.json"
     )
     shutil.copy2(state_path, backup)
-    temporary = state_path.with_name(
-        f".{state_path.name}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(
             json.dumps(
@@ -183,21 +181,25 @@ def _generate(args: argparse.Namespace, config: ProxyFactorConfig) -> dict:
 
 def _verify(args: argparse.Namespace, config: ProxyFactorConfig) -> dict:
     years = tuple(args.year) if args.year else config.years
-    reports = {
-        str(year): verify_materialized_year(config, year) for year in years
-    }
+    reports = {str(year): verify_materialized_year(config, year) for year in years}
     payload: dict = {"years": reports}
-    if args.causality:
-        causality = verify_pandas_causality()
-        if not causality["passed"]:
-            raise ValueError(f"causality verification failed: {causality['error']}")
-        payload["causality"] = causality
-    if args.boundary:
+    provider = None
+    causality = None
+    if args.causality or args.boundary or args.finalize:
         provider = QlibProxyProvider(
             config.provider_uri,
             universe=config.universe,
             kernels=args.kernels,
         )
+    if args.causality or args.finalize:
+        assert provider is not None
+        causality = verify_causality_audit(config, provider)
+        if not causality["passed"]:
+            formula_error = causality["qlib_vs_pandas"].get("error", "unknown")
+            raise ValueError(f"causality verification failed: {formula_error}")
+        payload["causality"] = causality
+    if args.boundary:
+        assert provider is not None
         boundary = {
             str(year): verify_year_boundary(config, provider, year) for year in years
         }
@@ -206,7 +208,10 @@ def _verify(args: argparse.Namespace, config: ProxyFactorConfig) -> dict:
             raise ValueError(f"year-boundary verification failed: {failures}")
         payload["boundary"] = boundary
     if args.finalize:
-        payload["manifest"] = finalize_dataset(config)
+        payload["manifest"] = finalize_dataset(
+            config,
+            causality_audit=causality,
+        )
     payload["status"] = dataset_status(config)
     return payload
 

@@ -160,4 +160,3 @@ class ProxyFactorStore:
             assets=tuple(selected),
             factor=factor,
         )
-

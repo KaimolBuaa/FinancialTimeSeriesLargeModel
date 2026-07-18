@@ -67,7 +67,9 @@ class ProxyFactorConfig:
             self._validate_output_location(project_root)
 
     def _validate_output_location(self, project_root: Path) -> None:
-        protected = tuple((project_root / name).resolve() for name in ("src", "tests", "configs"))
+        protected = tuple(
+            (project_root / name).resolve() for name in ("src", "tests", "configs")
+        )
         for path in protected:
             if self.output_root == path or path in self.output_root.parents:
                 raise ValueError(f"output_root overlaps protected project path: {path}")
@@ -121,7 +123,11 @@ def load_proxy_config(
 
     def resolve_path(value: str) -> Path:
         candidate = Path(value).expanduser()
-        return (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        return (
+            (root / candidate).resolve()
+            if not candidate.is_absolute()
+            else candidate.resolve()
+        )
 
     return ProxyFactorConfig(
         provider_uri=resolve_path(raw["provider_uri"]),
@@ -137,4 +143,3 @@ def load_proxy_config(
         max_near_constant_ratio=float(raw.get("max_near_constant_ratio", 0.99)),
         project_root=root,
     )
-
